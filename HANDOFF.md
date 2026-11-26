@@ -4,6 +4,7 @@
 **Stand:** 2026-11-26  
 **Status:** Architektur, Infrastruktur & Plan-Limits finalisiert → Start **Phase 1 (Bootstrap & Fundament)**  
 **Ziel:** Diese Datei ist die alleinige Quelle der Wahrheit für den Dev-Swarm. Antigravity materialisiert hieraus `AGENTS.md`, `specs/001`–`005`, `config/universe.json`, `.env.example` und `docker-compose.yml` ins Repository.
+- **Git-Workflow (No-PR-Policy):** Pull Requests sind im Repository deaktiviert (`gh pr create` ist untersagt). Parallele Arbeitspakete laufen auf lokalen Branches (`feat/...`), werden nach lokalem Review und grünen Tests lokal in `main` gemergt (`git merge --no-ff`), direkt auf `origin main` gepusht und anschließend lokal gelöscht (`git branch -d`).
 
 ---
 
