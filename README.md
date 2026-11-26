@@ -48,4 +48,68 @@ SentiX kombiniert eine latenzkritische **C++20/23-Engine** für das Rausch-Filte
 
 | Komponente | Technologie |
 | --- | --- |
-| **Ziel
+| **Zielplattform** | Headless Linux (Debian 13 / Ubuntu 24.04 LTS, x86_64) |
+| **Fast-Path Engine** | C++20/23, CMake, GoogleTest, ONNX Runtime (FinBERT `INT8`) |
+| **Core & Orchestrierung** | .NET 10 (C#), ASP.NET Core, SignalR, EF Core / Npgsql |
+| **IPC** | Unix Domain Socket (`AF_UNIX`, 4-Byte Little-Endian Framing, `tmpfs`) |
+| **Datenbank** | PostgreSQL 17 (Append-Only Audit-Trail) |
+| **Frontend** | React + TypeScript (Dashboard & Kill-Switch) |
+| **Broker & Marktdaten** | Alpaca Paper Trading API (`v1beta1/news`, `v2/iex`, Basic Plan), Alpaca CLI (Ops/Diagnose) |
+| **Optionale Feeds** | SEC EDGAR (8-K), X API v2 Filtered Stream (`SentiX2026`), Earnings-/Makro-Kalender (Finnhub / RSS) |
+| **Deployment** | Docker Compose (Single-Instance) auf netcup RS 1000 G12.5 (Manassas, VA) |
+
+---
+
+## Projektstruktur (Zielbild nach Phase 1)
+
+```text
+SentiX/
+├── AGENTS.md              # Multi-Agenten-Regeln & No-PR-Policy
+├── HANDOFF.md             # Master-Spezifikation (Single Source of Truth)
+├── SentiX.slnx            # .NET 10 Solution
+├── docker-compose.yml     # PostgreSQL 17 + sentix-native + sentix-host
+├── .env.example           # Vorlage für API-Keys & Secrets
+├── config/universe.json   # Watchlist, Sektor-ETFs & Social-Allowlist
+├── specs/                 # Technische Verträge (001–005)
+├── src/
+│   ├── native/            # C++20/23 Fast-Path Daemon + GoogleTest
+│   ├── dotnet/            # Domain, Ingestion, NativeBridge, DecisionSwarm, Risk, Execution, Infra, Host
+│   └── web/               # React + TypeScript Dashboard
+├── tests/                 # Risk-, DecisionSwarm- & IPC-Integrationstests
+└── deploy/                # Linux-Dockerfiles (native & host)
+```
+
+---
+
+## Build, Test & Start (Linux)
+
+```bash
+# 1. Konfiguration anlegen (Secrets niemals committen)
+cp .env.example .env
+
+# 2. C++20/23 Fast-Path bauen & testen
+cmake -S src/native -B build/native -DCMAKE_BUILD_TYPE=Release
+cmake --build build/native -j
+ctest --test-dir build/native --output-on-failure
+
+# 3. .NET 10 Solution bauen & testen
+dotnet build SentiX.slnx -c Release
+dotnet test SentiX.slnx -c Release
+
+# 4. Web-Dashboard bauen
+npm --prefix src/web ci && npm --prefix src/web run build
+
+# 5. Container-Stack starten (Single-Instance)
+docker compose up -d --build
+```
+
+---
+
+## Phasenplan & Workflow
+
+- **Phase 1 (Aktuell):** Bootstrap, CI, PostgreSQL-Schema, C++ IPC-Daemon (HTML-Stripping + Mock-Scorer), Hard-Risk-Manager (100 % Coverage, Long-Only), NativeBridge & Alpaca News Collector (0 Trades).
+- **Phase 2:** Lokales ONNX-FinBERT (`INT8`), SEC-EDGAR- & X-Filtered-Stream-Adapter, Earnings-/Makro-Kalender-Sync (`scheduled_events`).
+- **Phase 3:** Decision-Swarm-Orchestrierung, Debatten-Persistenz & React-Dashboard im Shadow-Mode.
+- **Phase 4:** Alpaca Paper Execution (Bracket-Orders), UI-Kill-Switch und 4–8 Wochen Live-Paper-Test gegen SPY.
+
+**Git-Workflow:** Dieses Repository arbeitet strikt ohne GitHub Pull Requests (**No-PR-Policy**). Parallele Feature-Branches werden lokal geprüft, per `git merge --no-ff` in `main` integriert und direkt gepusht. Details siehe [`HANDOFF.md`](./HANDOFF.md).
