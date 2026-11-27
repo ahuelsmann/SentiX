@@ -230,21 +230,31 @@ public sealed class DecisionSwarmOrchestrator : IDecisionSwarmOrchestrator
             }
 
             var window = remaining < PerAgentTimeout ? remaining : PerAgentTimeout;
-            using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(scope.Effective);
-            var callTask = InvokeClientAsync(request, attemptCts.Token);
-            var timeoutTask = Task.Delay(window, _time, CancellationToken.None);
-            var cancelTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            await using var cancelReg = scope.Effective.Register(
-                static s => ((TaskCompletionSource)s!).TrySetResult(), cancelTcs);
-            var winner = await Task.WhenAny(callTask, timeoutTask, cancelTcs.Task).ConfigureAwait(false);
+            var attemptCts = new CancellationTokenSource();
+            Task<LlmCompletionResult> callTask;
+            Task winner;
+            Task timeoutTask;
+            bool accepted;
+            try
+            {
+                callTask = InvokeClientAsync(request, attemptCts.Token);
+                timeoutTask = Task.Delay(window, _time, CancellationToken.None);
+                var cancelTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                await using var cancelReg = scope.Effective.Register(
+                    static s => ((TaskCompletionSource)s!).TrySetResult(), cancelTcs);
+                winner = await Task.WhenAny(callTask, timeoutTask, cancelTcs.Task).ConfigureAwait(false);
 
-            var accepted = ReferenceEquals(winner, callTask) &&
+                accepted = ReferenceEquals(winner, callTask) &&
                            !timeoutTask.IsCompleted &&
+                           !scope.Effective.IsCancellationRequested &&
                            !attemptCts.IsCancellationRequested &&
                            _time.GetUtcNow() <= state.BudgetDeadline;
-
-            // Cancels the (possibly still running) call in every case.
-            await attemptCts.CancelAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                // Cancel and dispose off the critical path so slow or throwing client callbacks never stall or escape.
+                ScheduleCancelAndDispose(attemptCts);
+            }
 
             if (!accepted)
             {
@@ -338,6 +348,32 @@ public sealed class DecisionSwarmOrchestrator : IDecisionSwarmOrchestrator
         {
             throw new AgentFailedException($"{role}: cancelled");
         }
+    }
+
+    private void ScheduleCancelAndDispose(CancellationTokenSource cts)
+    {
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                cts.Cancel();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Decision-Swarm attempt cancellation callback faulted.");
+            }
+            finally
+            {
+                try
+                {
+                    cts.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Decision-Swarm CancellationTokenSource dispose faulted.");
+                }
+            }
+        }, CancellationToken.None);
     }
 
     private static void ObserveAbandoned(Task callTask)

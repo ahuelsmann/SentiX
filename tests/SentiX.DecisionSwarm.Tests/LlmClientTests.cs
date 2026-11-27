@@ -95,10 +95,12 @@ public sealed class LlmClientTests
         Assert.Equal(new Uri("https://api.anthropic.com/v1/messages"), handler.RequestUri);
         Assert.Equal(Fixtures.JudgeKey, handler.Headers["x-api-key"]);
         Assert.Equal("2023-06-01", handler.Headers["anthropic-version"]);
+        Assert.False(handler.Headers.ContainsKey("anthropic-beta"));
         Assert.False(handler.Headers.ContainsKey("Authorization"));
 
         using var body = JsonDocument.Parse(handler.Body!);
         var root = body.RootElement;
+        Assert.False(root.TryGetProperty("tools", out _));
         Assert.Equal("claude-sonnet-4-5", root.GetProperty("model").GetString());
         Assert.Equal("JUDGE-SYSTEM", root.GetProperty("system").GetString());
         Assert.Equal(768, root.GetProperty("max_tokens").GetInt32());
@@ -153,11 +155,14 @@ public sealed class LlmClientTests
 
         var result = await client.CompleteJsonAsync(JudgeSchemaRequest(), CancellationToken.None);
 
+        Assert.Equal(AnthropicLlmClient.StructuredOutputsBeta, handler.Headers["anthropic-beta"]);
+
         using var body = JsonDocument.Parse(handler.Body!);
         var root = body.RootElement;
         var tools = root.GetProperty("tools");
         Assert.Equal(1, tools.GetArrayLength());
         Assert.Equal("sentix_judge_agent", tools[0].GetProperty("name").GetString());
+        Assert.True(tools[0].GetProperty("strict").GetBoolean());
         var inputSchema = tools[0].GetProperty("input_schema");
         Assert.Equal("object", inputSchema.GetProperty("type").GetString());
         Assert.False(inputSchema.GetProperty("additionalProperties").GetBoolean());
@@ -174,7 +179,7 @@ public sealed class LlmClientTests
     }
 
     [Fact]
-    public async Task Anthropic_WithJsonSchema_AcceptsStrictJsonTextBlock_WhenNoToolUsePresent()
+    public async Task Anthropic_WithJsonSchema_RejectsTextOnlyResponse_WithoutToolUse()
     {
         var textOnlyResponse = JsonSerializer.Serialize(new
         {
@@ -186,9 +191,10 @@ public sealed class LlmClientTests
         var handler = new StubHttpMessageHandler(_ => StubHttpMessageHandler.Json(HttpStatusCode.OK, textOnlyResponse));
         var client = new AnthropicLlmClient(new HttpClient(handler), Fixtures.ConfiguredOptions());
 
-        var result = await client.CompleteJsonAsync(JudgeSchemaRequest(), CancellationToken.None);
+        var ex = await Assert.ThrowsAsync<LlmResponseFormatException>(() =>
+            client.CompleteJsonAsync(JudgeSchemaRequest(), CancellationToken.None));
 
-        Assert.Equal(Fixtures.JudgeJson("HOLD"), result.Json);
+        Assert.True(ex.IsTransient);
     }
 
     [Theory]

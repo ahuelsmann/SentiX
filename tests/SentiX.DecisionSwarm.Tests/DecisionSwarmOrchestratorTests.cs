@@ -560,6 +560,79 @@ public sealed class DecisionSwarmOrchestratorTests
     }
 
     [Fact]
+    public async Task Stage1_ThrowingAndBlockingCancellationCallbacks_DoNotBlockOrEscapeHoldFallback()
+    {
+        var (sut, client, time) = Create();
+        using var releaseBlockingCallback = new ManualResetEventSlim(false);
+        var callbacksRegistered = 0;
+
+        client.Handlers[AgentRole.FactAnalyst] = (_, ct) =>
+        {
+            ct.Register(() => throw new InvalidOperationException("boom"));
+            ct.Register(() => releaseBlockingCallback.Wait(TimeSpan.FromSeconds(30)));
+            Interlocked.Increment(ref callbacksRegistered);
+            return new TaskCompletionSource<LlmCompletionResult>(TaskCreationOptions.RunContinuationsAsynchronously).Task;
+        };
+
+        try
+        {
+            var wallClock = Stopwatch.StartNew();
+            var outcome = await time.DriveAsync(sut.EvaluateAsync(Fixtures.Request(), CancellationToken.None), client,
+                TimeSpan.FromMilliseconds(500));
+            wallClock.Stop();
+
+            AssertFailClosed(outcome, "FactAnalyst: timeout after 1 retry");
+            Assert.Equal(2, callbacksRegistered);
+            Assert.InRange(time.Elapsed, TimeSpan.FromSeconds(16), TimeSpan.FromSeconds(19));
+            Assert.True(wallClock.Elapsed < TimeSpan.FromSeconds(5),
+                $"Expected non-blocking return, took {wallClock.Elapsed}.");
+        }
+        finally
+        {
+            releaseBlockingCallback.Set();
+        }
+    }
+
+    [Fact]
+    public async Task Stage2_BudgetDeadline_WithThrowingAndBlockingCallbacks_ReturnsHoldImmediately()
+    {
+        var (sut, client, time) = Create();
+        using var releaseBlockingCallback = new ManualResetEventSlim(false);
+        var callbacksRegistered = 0;
+
+        client.Handlers[AgentRole.FactAnalyst] = async (_, ct) =>
+        {
+            await Task.Delay(TimeSpan.FromSeconds(7), time, ct);
+            return ScriptedLlmClient.Result(Fixtures.FactJson);
+        };
+        client.Handlers[AgentRole.BullAgent] = (_, ct) =>
+        {
+            ct.Register(() => throw new InvalidOperationException("boom"));
+            ct.Register(() => releaseBlockingCallback.Wait(TimeSpan.FromSeconds(30)));
+            Interlocked.Increment(ref callbacksRegistered);
+            return new TaskCompletionSource<LlmCompletionResult>(TaskCreationOptions.RunContinuationsAsynchronously).Task;
+        };
+
+        try
+        {
+            var wallClock = Stopwatch.StartNew();
+            var outcome = await time.DriveAsync(sut.EvaluateAsync(Fixtures.Request(), CancellationToken.None), client,
+                TimeSpan.FromMilliseconds(500));
+            wallClock.Stop();
+
+            AssertFailClosed(outcome, "BullAgent: debate_budget_exhausted");
+            Assert.Equal(2, callbacksRegistered);
+            Assert.InRange(time.Elapsed, TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(21));
+            Assert.True(wallClock.Elapsed < TimeSpan.FromSeconds(5),
+                $"Expected non-blocking return at budget deadline, took {wallClock.Elapsed}.");
+        }
+        finally
+        {
+            releaseBlockingCallback.Set();
+        }
+    }
+
+    [Fact]
     public async Task CallerCancellation_Propagates()
     {
         var (sut, client, _) = Create();
