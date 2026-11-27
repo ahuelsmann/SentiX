@@ -96,7 +96,12 @@ public sealed class ScheduledEventsSyncWorker(
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
         var events = new HashSet<ScheduledEventRow>();
         var (earnings, _) = await ReadCalendarStatusAsync<EarningsCalendar>($"earnings?{range}", optional: false, token);
-        foreach (var item in earnings?.EarningsCalendarEntries ?? [])
+        if (earnings?.EarningsCalendarEntries is null)
+        {
+            throw new JsonException("Finnhub earnings calendar payload did not contain an 'earningsCalendar' array.");
+        }
+
+        foreach (var item in earnings.EarningsCalendarEntries)
         {
             if (item is null || string.IsNullOrWhiteSpace(item.Symbol) || !watched.Contains(item.Symbol) ||
                 !DateOnly.TryParseExact(item.Date, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None,
@@ -137,7 +142,7 @@ public sealed class ScheduledEventsSyncWorker(
             }
         }
 
-        bool includesEconomicCalendar = macroAvailable && macro is not null;
+        bool includesEconomicCalendar = macroAvailable && macro?.EconomicCalendarEntries is not null;
         return new CalendarSyncSnapshot(fromDateUtc, toDateUtc, events, includesEconomicCalendar);
     }
 

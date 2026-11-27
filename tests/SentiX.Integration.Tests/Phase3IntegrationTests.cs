@@ -84,15 +84,96 @@ public sealed class Phase3IntegrationTests
             "Strong SEC 8-K catalyst",
             "Minor margin risk");
 
-        var decision = MarketEventPipeline.EvaluateShadowHardRisk(proposal, "AAPL", quotes, universe, now);
+        var decision = MarketEventPipeline.EvaluateShadowHardRisk(
+            proposal, "AAPL", quotes, universe, Risk.TradingState.Active, now);
         Assert.True(decision.Approved);
         Assert.True(decision.CalculatedQuantity > 0);
         Assert.NotNull(decision.ClientOrderId);
 
         var blockedOutsideHours = MarketEventPipeline.EvaluateShadowHardRisk(
-            proposal, "AAPL", quotes, universe, new DateTimeOffset(2026, 6, 6, 15, 0, 0, TimeSpan.Zero));
+            proposal, "AAPL", quotes, universe, Risk.TradingState.Active, new DateTimeOffset(2026, 6, 6, 15, 0, 0, TimeSpan.Zero));
         Assert.False(blockedOutsideHours.Approved);
         Assert.Contains(blockedOutsideHours.Violations, v => v.Code == Risk.RiskViolationCode.OutsideTradingHours);
+
+        var missingQuoteDecision = MarketEventPipeline.EvaluateShadowHardRisk(
+            proposal, "MSFT", quotes, universe, Risk.TradingState.Active, now);
+        Assert.False(missingQuoteDecision.Approved);
+        Assert.Equal(0, missingQuoteDecision.CalculatedQuantity);
+        Assert.Null(missingQuoteDecision.ClientOrderId);
+        Assert.Contains(missingQuoteDecision.Violations, v => v.Code == Risk.RiskViolationCode.InsufficientBuyingPower);
+
+        var haltedDecision = MarketEventPipeline.EvaluateShadowHardRisk(
+            proposal, "AAPL", quotes, universe, MarketEventPipeline.ParsePersistedTradingState("HALTED_MANUAL"), now);
+        Assert.False(haltedDecision.Approved);
+        Assert.Equal(Risk.TradingState.HaltedManual, haltedDecision.EffectiveTradingState);
+        Assert.Contains(haltedDecision.Violations, v => v.Code == Risk.RiskViolationCode.KillSwitchActive);
+
+        Assert.Equal(Risk.TradingState.HaltedDailyLoss, MarketEventPipeline.ParsePersistedTradingState("HALTED_DAILY_LOSS"));
+        Assert.Equal(Risk.TradingState.HaltedSystemError, MarketEventPipeline.ParsePersistedTradingState(null));
+        Assert.Equal(Risk.TradingState.HaltedSystemError, MarketEventPipeline.ParsePersistedTradingState("UNKNOWN_STATE"));
+    }
+
+    [Fact]
+    public async Task ScheduledEventsSyncWorkerRejectsMissingEarningsArrayAndPreservesEconomicOnEmptyObject()
+    {
+        var universe = UniverseConfigLoader.Load(UniverseAndXTests.UniversePath);
+        var now = new DateTimeOffset(2026, 6, 4, 14, 0, 0, TimeSpan.Zero);
+        using var pipeline = new DummyPipeline();
+
+        using var badEarningsWorker = new ScheduledEventsSyncWorker(
+            new FinnhubOptions("finnhub-key"),
+            universe,
+            pipeline,
+            new ScheduledEventStore(new ThrowingDbFactory()),
+            new HttpClient(new CustomFinnhubHandler("""{}""", """{"economicCalendar":[]}""")),
+            new FixedClock(now),
+            NullLogger<ScheduledEventsSyncWorker>.Instance);
+
+        await Assert.ThrowsAsync<JsonException>(() => badEarningsWorker.FetchSnapshotAsync(CancellationToken.None));
+
+        using var emptyMacroObjectWorker = new ScheduledEventsSyncWorker(
+            new FinnhubOptions("finnhub-key"),
+            universe,
+            pipeline,
+            new ScheduledEventStore(new ThrowingDbFactory()),
+            new HttpClient(new CustomFinnhubHandler(
+                """{"earningsCalendar":[{"symbol":"AAPL","date":"2026-06-05","hour":"amc"}]}""",
+                """{}""")),
+            new FixedClock(now),
+            NullLogger<ScheduledEventsSyncWorker>.Instance);
+
+        var snapshotMissingMacroArray = await emptyMacroObjectWorker.FetchSnapshotAsync(CancellationToken.None);
+        Assert.False(snapshotMissingMacroArray.IncludesEconomicCalendar);
+        Assert.Single(snapshotMissingMacroArray.Events);
+
+        using var explicitEmptyMacroArrayWorker = new ScheduledEventsSyncWorker(
+            new FinnhubOptions("finnhub-key"),
+            universe,
+            pipeline,
+            new ScheduledEventStore(new ThrowingDbFactory()),
+            new HttpClient(new CustomFinnhubHandler(
+                """{"earningsCalendar":[{"symbol":"AAPL","date":"2026-06-05","hour":"amc"}]}""",
+                """{"economicCalendar":[]}""")),
+            new FixedClock(now),
+            NullLogger<ScheduledEventsSyncWorker>.Instance);
+
+        var snapshotEmptyMacroArray = await explicitEmptyMacroArrayWorker.FetchSnapshotAsync(CancellationToken.None);
+        Assert.True(snapshotEmptyMacroArray.IncludesEconomicCalendar);
+    }
+
+    private sealed class CustomFinnhubHandler(string earningsJson, string economicJson) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var uri = request.RequestUri?.PathAndQuery ?? string.Empty;
+            var body = uri.Contains("/calendar/earnings", StringComparison.Ordinal)
+                ? earningsJson
+                : economicJson;
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(body, Encoding.UTF8, "application/json")
+            });
+        }
     }
 
     [Fact]

@@ -175,8 +175,14 @@ public sealed class MarketEventPipeline(
             (int)Math.Clamp(outcome.TotalLatencyMs, 0, int.MaxValue),
             now);
 
+        var persistedTradingState = await db.SystemState.AsNoTracking()
+            .Where(row => row.Id == 1)
+            .Select(row => row.TradingState)
+            .SingleOrDefaultAsync(token);
+        var tradingState = ParsePersistedTradingState(persistedTradingState);
+
         // Phase 3 runs HardRiskManager strictly in shadow mode (virtual paper portfolio, zero broker orders).
-        var riskDecision = EvaluateShadowHardRisk(proposal, ticker, quoteCache, universe, now);
+        var riskDecision = EvaluateShadowHardRisk(proposal, ticker, quoteCache, universe, tradingState, now);
         var violationsJson = JsonSerializer.Serialize(
             riskDecision.Violations.Select(static v => new { code = v.Code.ToString(), message = v.Message }),
             SentiXJson.Options);
@@ -198,11 +204,29 @@ public sealed class MarketEventPipeline(
         await db.SaveChangesAsync(token);
     }
 
+    internal static SentiX.Risk.TradingState ParsePersistedTradingState(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return SentiX.Risk.TradingState.HaltedSystemError;
+        }
+
+        return raw.Trim().ToUpperInvariant() switch
+        {
+            "ACTIVE" => SentiX.Risk.TradingState.Active,
+            "HALTED_DAILY_LOSS" => SentiX.Risk.TradingState.HaltedDailyLoss,
+            "HALTED_MANUAL" => SentiX.Risk.TradingState.HaltedManual,
+            "HALTED_SYSTEM_ERROR" => SentiX.Risk.TradingState.HaltedSystemError,
+            _ => SentiX.Risk.TradingState.HaltedSystemError,
+        };
+    }
+
     internal static RiskDecision EvaluateShadowHardRisk(
         SentiX.Domain.TradeProposal proposal,
         string? normalizedTicker,
         IMarketQuoteCache? quoteCache,
         UniverseConfig? universe,
+        SentiX.Risk.TradingState tradingState,
         DateTimeOffset nowUtc)
     {
         var riskAction = proposal.Action switch
@@ -235,7 +259,7 @@ public sealed class MarketEventPipeline(
         }
 
         var askPrice = tickerQuote is { AskPrice: > 0m } ? tickerQuote.AskPrice :
-            tickerQuote is { MidPrice: > 0m } ? tickerQuote.MidPrice : 100m;
+            tickerQuote is { MidPrice: > 0m } ? tickerQuote.MidPrice : 0m;
 
         var targetSector = universe?.Watchlist
             .FirstOrDefault(e => string.Equals(e.Ticker, normalizedTicker, StringComparison.OrdinalIgnoreCase))
@@ -245,7 +269,7 @@ public sealed class MarketEventPipeline(
             ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         var shadowPortfolio = new PortfolioSnapshot(
-            SentiX.Risk.TradingState.Active,
+            tradingState,
             Equity: 100_000m,
             BuyingPower: 100_000m,
             DailyPnLPct: 0d,
