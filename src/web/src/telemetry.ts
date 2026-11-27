@@ -2,12 +2,13 @@ export type Health = {
   status: string
   native: string
   phase: number
-  tradingEnabled: boolean
+  tradingEnabled: boolean | null
 }
 
 export type Overview = {
   phase: number
   nativeStatus: string
+  orderExecutionEnabled: boolean | null
   databaseConfigured: boolean
   decisionSwarmConfigured?: boolean
   counts: {
@@ -69,7 +70,7 @@ export type Section<T> =
   | { state: 'offline' | 'unavailable' }
   | { state: 'ready'; value: T }
 
-export type Items<T> = { items: T[]; databaseConfigured?: boolean }
+export type Items<T> = { items: T[]; databaseConfigured?: boolean; dropped: number }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -92,13 +93,22 @@ function nativeStatus(value: Record<string, unknown>): string | null {
     (typeof value.nativeScorerReady === 'boolean' ? (value.nativeScorerReady ? 'ready' : 'not ready') : null)
 }
 
+function readBoolean(value: unknown): boolean | null {
+  return typeof value === 'boolean' ? value : null
+}
+
+export function resolveOrderExecution(health?: Health | null, overview?: Overview | null): boolean | null {
+  if (health?.tradingEnabled === true || overview?.orderExecutionEnabled === true) return true
+  return health?.tradingEnabled ?? overview?.orderExecutionEnabled ?? null
+}
+
 function decodeHealth(value: unknown): Health | null {
   if (!isRecord(value)) return null
   const status = text(value.status)
   const native = nativeStatus(value)
   const phase = finite(value.phase)
   if (status === null || native === null || phase === null) return null
-  return { status, native, phase, tradingEnabled: (value.orderExecutionEnabled ?? value.tradingEnabled) === true }
+  return { status, native, phase, tradingEnabled: readBoolean(value.orderExecutionEnabled ?? value.tradingEnabled) }
 }
 
 function decodeOverview(value: unknown): Overview | null {
@@ -110,6 +120,7 @@ function decodeOverview(value: unknown): Overview | null {
   return {
     phase,
     nativeStatus: native,
+    orderExecutionEnabled: readBoolean(value.orderExecutionEnabled ?? value.tradingEnabled),
     databaseConfigured: value.databaseConfigured !== false,
     decisionSwarmConfigured: typeof value.decisionSwarmConfigured === 'boolean' ? value.decisionSwarmConfigured : undefined,
     counts: {
@@ -215,9 +226,8 @@ function itemDecoder<T>(decode: (value: unknown) => T | null) {
     const envelope = isRecord(value) ? value : null
     const items: unknown = envelope ? envelope.items : value
     if (!Array.isArray(items)) return null
-    const decoded = items.map(decode)
-    if (!decoded.every((item): item is T => item !== null)) return null
-    return { items: decoded, databaseConfigured: envelope?.databaseConfigured !== false }
+    const decoded = items.map(decode).filter((item): item is T => item !== null)
+    return { items: decoded, databaseConfigured: envelope?.databaseConfigured !== false, dropped: items.length - decoded.length }
   }
 }
 

@@ -11,7 +11,12 @@ public sealed class Phase2IngestionTests
 {
     private static readonly UniverseConfig Universe = new(1, 30, new FastPathConfig(0.5, 90),
         "SPY", new Dictionary<string, string> { ["Technology"] = "XLK" },
-        [new WatchlistEntry("AAPL", "Technology", ["Apple", "Apple Inc."])], []);
+        [
+            new WatchlistEntry("AAPL", "Technology", ["Apple", "Apple Inc."], Cik: "0000320193"),
+            new WatchlistEntry("AMZN", "Technology", ["Amazon", "Amazon com", "Amazon.com"]),
+            new WatchlistEntry("XOM", "Energy", ["Exxon", "ExxonMobil", "Exxon Mobil"]),
+            new WatchlistEntry("JPM", "Financials", ["JPMorgan", "JPMorgan Chase", "JPMorgan Chase & Co"])
+        ], []);
 
     [Theory]
     [InlineData(null)]
@@ -36,16 +41,52 @@ public sealed class Phase2IngestionTests
     [InlineData("Appleton Inc.", false)]
     public void SecMatchesCompanyAliasOnlyAtTheStartWithOptionalCorporateSuffixes(string company, bool expected)
     {
+        var result = SecEdgarCollector.TryNormalize(CreateFiling(company), Universe);
+
+        Assert.Equal(expected, result is not null);
+    }
+
+    [Theory]
+    [InlineData("AMAZON COM INC", "AMZN")]
+    [InlineData("EXXON MOBIL CORP", "XOM")]
+    [InlineData("JPMORGAN CHASE & CO", "JPM")]
+    public void SecRecognizesEdgarFilerAliases(string company, string ticker)
+    {
+        var result = SecEdgarCollector.TryNormalize(CreateFiling(company), Universe);
+
+        Assert.NotNull(result);
+        Assert.Equal(ticker, Assert.Single(result.Value.Event.SourceTickers));
+    }
+
+    [Theory]
+    [InlineData("Unrecognized name", "0000320193", true)]
+    [InlineData("Unrecognized name", "320193", true)]
+    [InlineData("Apple Hospitality REIT, Inc.", "9999999999", false)]
+    [InlineData("Unrecognized name", "0000000000", false)]
+    public void SecUsesFilerCikWithoutDependingOnTheCompanyAlias(string company, string cik, bool expected)
+    {
+        var result = SecEdgarCollector.TryNormalize(CreateFiling(company, cik), Universe);
+
+        if (expected)
+        {
+            Assert.NotNull(result);
+            Assert.Equal("AAPL", Assert.Single(result.Value.Event.SourceTickers));
+        }
+        else
+        {
+            Assert.Null(result);
+        }
+    }
+
+    private static XElement CreateFiling(string company, string? cik = null)
+    {
         XNamespace atom = "http://www.w3.org/2005/Atom";
-        var filing = new XElement(atom + "entry",
-            new XElement(atom + "title", $"8-K - {company} (0000320193) (Filer)"),
+        var filerCik = cik is null ? string.Empty : $" ({cik})";
+        return new XElement(atom + "entry",
+            new XElement(atom + "title", $"8-K - {company}{filerCik} (Filer)"),
             new XElement(atom + "category", new XAttribute("term", "8-K")),
             new XElement(atom + "id", "urn:tag:sec.gov,2008:accession-number=0000320193-26-000001"),
             new XElement(atom + "updated", "2026-06-04T15:00:00-04:00"));
-
-        var result = SecEdgarCollector.TryNormalize(filing, Universe);
-
-        Assert.Equal(expected, result is not null);
     }
 
     [Fact]

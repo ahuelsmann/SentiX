@@ -54,6 +54,13 @@ section { min-width: 0; margin-top: 1.35rem; }
   font-size: .875rem;
 }
 .tag.ready { color: var(--accent); }
+.tag.danger, .safety-alert {
+  color: #ffcaca;
+  border: 1px solid #a45e65;
+  background: #382529;
+}
+.safety-alert, .data-warning { margin-top: .65rem; padding: .65rem .8rem; border-radius: .4rem; }
+.data-warning { color: #ffe0a1; margin-bottom: .6rem; }
 .refresh-toggle { cursor: pointer; }
 .refresh-toggle input { accent-color: var(--accent); }
 
@@ -77,8 +84,27 @@ dd { margin-top: .35rem; font-weight: 650; font-variant-numeric: tabular-nums; }
 .metrics dd { font-size: 1.2rem; }
 .empty { color: var(--muted); }
 .debate + .debate { margin-top: .55rem; }
-summary { padding: .75rem .9rem; cursor: pointer; }
-.debate-title { display: inline-grid; gap: .25rem; margin-inline: .45rem .8rem; vertical-align: middle; }
+.debate summary {
+  display: grid;
+  grid-template-columns: .65rem minmax(0, 1fr) auto;
+  align-items: start;
+  gap: .65rem;
+  padding: .75rem .9rem;
+  cursor: pointer;
+  list-style: none;
+}
+.debate summary::-webkit-details-marker { display: none; }
+.debate summary::before {
+  content: '';
+  width: .42rem;
+  height: .42rem;
+  margin-top: .4rem;
+  border-right: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  transform: rotate(-45deg);
+}
+.debate[open] > summary::before { transform: rotate(45deg); }
+.debate-title { display: grid; gap: .25rem; overflow-wrap: anywhere; }
 .debate-body { display: grid; padding: .85rem; gap: .65rem; border-top: 1px solid var(--border); }
 .parallel { grid-template-columns: repeat(auto-fit, minmax(min(13rem, 100%), 1fr)); }
 .stage { min-width: 0; padding: .65rem; background: var(--panel-raised); border-radius: .4rem; }
@@ -94,6 +120,6 @@ tbody tr:last-child > * { border-bottom: 0; }
 time { white-space: nowrap; }
 
 @media (max-width: 38rem) {
-  .debate-title { display: inline; }
-  .debate-title .muted { display: block; margin: .35rem 0; }
+  .debate summary { grid-template-columns: .65rem minmax(0, 1fr); }
+  .debate summary .tag { grid-column: 2; justify-self: start; }
 }

@@ -147,7 +147,9 @@ public sealed partial class SecEdgarCollector(
 
         var company = titleMatch.Groups["company"].Value;
         var cik = titleMatch.Groups["cik"].Value;
+        var normalizedCik = cik.TrimStart('0');
         var symbols = universe.Watchlist.Where(entry =>
+                (normalizedCik.Length > 0 && entry.Cik?.Trim().TrimStart('0') == normalizedCik) ||
                 entry.Ticker.Trim().Equals(company, StringComparison.OrdinalIgnoreCase) ||
                 entry.Aliases.Any(alias => MatchesCompany(company, alias)) ||
                 Regex.IsMatch(company, $@"\({Regex.Escape(entry.Ticker.Trim())}\)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))

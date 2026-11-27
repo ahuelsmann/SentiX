@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
-import { readTelemetry, type Debate, type Items, type Section } from './telemetry'
+import { readTelemetry, resolveOrderExecution, type Debate, type Items, type Section } from './telemetry'
 
 type Telemetry = Awaited<ReturnType<typeof readTelemetry>>
 
@@ -31,7 +31,13 @@ function DataList<T>({
     return <p className="empty">{section.state === 'offline' ? 'Telemetry is temporarily offline.' : 'This host does not expose this telemetry.'}</p>
   }
   if (section.value.databaseConfigured === false) return <p className="empty">PostgreSQL is not configured.</p>
-  return section.value.items.length === 0 ? <p className="empty">{empty}</p> : children(section.value.items)
+  const { items, dropped } = section.value
+  return (
+    <>
+      {dropped > 0 && <p className="data-warning">{dropped} invalid {dropped === 1 ? 'row skipped' : 'rows skipped'}.</p>}
+      {items.length === 0 ? <p className="empty">{dropped > 0 ? 'No valid rows received.' : empty}</p> : children(items)}
+    </>
+  )
 }
 
 function Stage({ name, data }: { name: string; data: unknown }) {
@@ -114,6 +120,7 @@ export default function App() {
   const nativeState = overview?.nativeStatus ?? health?.native
   const systemStatus = !telemetry ? 'Checking host' : health ? 'Host online' : 'Host unreachable'
   const counts = overview?.counts
+  const orderExecution = resolveOrderExecution(health, overview)
 
   return (
     <main>
@@ -141,8 +148,18 @@ export default function App() {
           <div><dt>Native Scorer</dt><dd>{nativeState ? readableStatus(nativeState) : 'Unknown'}</dd></div>
           <div><dt>Decision Swarm</dt><dd>{overview?.decisionSwarmConfigured === false ? 'Not configured' : counts?.debates != null ? number.format(counts.debates) + ' debates' : 'No telemetry'}</dd></div>
           <div><dt>Hard Risk Shadow</dt><dd>{counts?.riskEvaluated != null ? number.format(counts.riskEvaluated) + ' evaluated' : 'No telemetry'}</dd></div>
-          <div><dt>Order Execution</dt><dd><span className="tag">Disabled</span></dd></div>
+          <div>
+            <dt>Order Execution</dt>
+            <dd><span className={orderExecution === false ? 'tag' : 'tag danger'}>
+              {orderExecution === false ? 'Disabled (Shadow Only)' : orderExecution === true ? 'Unexpectedly enabled' : 'Unverified'}
+            </span></dd>
+          </div>
         </dl>
+        {orderExecution !== false && (
+          <p className="safety-alert" role="alert">
+            {orderExecution === true ? 'Host reports that order execution is enabled.' : 'The host has not confirmed that order execution is disabled.'}
+          </p>
+        )}
         <dl className="metrics">
           <div><dt>Events</dt><dd>{counts?.events != null ? number.format(counts.events) : '—'}</dd></div>
           <div><dt>Fast-path passes</dt><dd>{counts?.fastPathPassed != null ? number.format(counts.fastPathPassed) : '—'}</dd></div>
@@ -163,7 +180,7 @@ export default function App() {
           <div className="section-heading"><h2 id="quotes">Live IEX quotes</h2></div>
           <DataList section={telemetry?.quotes} empty="No IEX quotes are cached.">
             {items => (
-              <div className="table-scroll" tabIndex={0} role="region" aria-labelledby="quotes">
+              <div className="table-scroll" tabIndex={0}>
                 <table>
                   <thead><tr>{['Symbol', 'Bid', 'Ask', 'Mid', 'Spread (bps)', 'As of'].map(label => <th key={label} scope="col">{label}</th>)}</tr></thead>
                   <tbody>{items.map(quote => (
@@ -184,7 +201,7 @@ export default function App() {
           <div className="section-heading"><h2 id="calendar">14-day calendar</h2></div>
           <DataList section={telemetry?.calendar} empty="No events are scheduled in the next 14 days.">
             {items => (
-              <div className="table-scroll" tabIndex={0} role="region" aria-labelledby="calendar">
+              <div className="table-scroll" tabIndex={0}>
                 <table>
                   <thead><tr>{['Event', 'Type', 'Symbol', 'Scheduled', 'Session', 'Source'].map(label => <th key={label} scope="col">{label}</th>)}</tr></thead>
                   <tbody>{items.map(event => (
