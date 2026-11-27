@@ -1,78 +1,99 @@
 :root {
   font-family: system-ui, sans-serif;
   color-scheme: dark;
-  color: #eef4f8;
-  background: #101821;
+  color: #eaf2f5;
+  background: #10181e;
   font-synthesis: none;
+  --panel: #172229;
+  --panel-raised: #1d2b34;
+  --border: #354651;
+  --muted: #b5c4ce;
+  --accent: #9be8ce;
 }
 
-body {
-  margin: 0;
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { width: min(88rem, 100% - 2rem); margin: 0 auto; padding: 2rem 0 3rem; }
+h1, h2, h3, p, dl, dd { margin: 0; }
+h1 { font-size: clamp(2rem, 5vw, 3.5rem); line-height: 1.08; letter-spacing: -.04em; }
+h2 { font-size: 1.16rem; }
+h3 { font-size: .95rem; }
+section { min-width: 0; margin-top: 1.35rem; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+.header,
+.toolbar,
+.section-heading {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: .75rem 1.25rem;
 }
 
-main {
-  width: min(58rem, 100% - 2.5rem);
-  margin: 0 auto;
-  padding: clamp(2.5rem, 8vw, 6rem) 0;
+.header {
+  padding: 0 0 1.5rem;
+  border-bottom: 1px solid var(--border);
 }
 
-.product {
-  color: #81e5bf;
-  font-weight: 700;
-  letter-spacing: .08em;
-  margin: 0 0 .75rem;
-}
+.product { margin-bottom: .35rem; color: var(--accent); font-weight: 760; }
+.header .muted { margin-top: .5rem; }
+.muted { color: var(--muted); font-size: .875rem; }
+.section-heading { margin-bottom: .75rem; }
 
-h1 {
-  font-size: clamp(2rem, 7vw, 3.5rem);
-  line-height: 1.08;
-  letter-spacing: -.045em;
-  margin: 0;
+.tag,
+.refresh-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: .5rem;
+  min-height: 2rem;
+  padding: .25rem .65rem;
+  border: 1px solid var(--border);
+  border-radius: .4rem;
+  background: var(--panel-raised);
+  font-size: .875rem;
 }
+.tag.ready { color: var(--accent); }
+.refresh-toggle { cursor: pointer; }
+.refresh-toggle input { accent-color: var(--accent); }
 
-.subtitle,
-.updated {
-  color: #aebfce;
-}
-
-section {
-  margin-top: 3rem;
-}
-
-h2 {
-  font-size: 1.125rem;
-}
-
-dl {
+.system-grid, .metrics, .tables, .parallel {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(12rem, 100%), 1fr));
-  gap: .75rem;
-  margin: 0;
+  gap: .65rem;
 }
 
-.status {
-  padding: 1.25rem;
-  background: #17232e;
-  border: 1px solid #314354;
-  border-radius: .75rem;
+.system-grid, .metrics {
+  grid-template-columns: repeat(auto-fit, minmax(min(11rem, 100%), 1fr));
 }
-
-dt {
-  color: #bfcfd9;
-  font-size: .9rem;
+.metrics { margin-top: .65rem; }
+.system-grid > div, .metrics > div, .empty, .debate, .table-scroll {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: .55rem;
 }
+.system-grid > div, .metrics > div, .empty { padding: .8rem .9rem; }
+dt { font-size: .85rem; color: var(--muted); }
+dd { margin-top: .35rem; font-weight: 650; font-variant-numeric: tabular-nums; }
+.metrics dd { font-size: 1.2rem; }
+.empty { color: var(--muted); }
+.debate + .debate { margin-top: .55rem; }
+summary { padding: .75rem .9rem; cursor: pointer; }
+.debate-title { display: inline-grid; gap: .25rem; margin-inline: .45rem .8rem; vertical-align: middle; }
+.debate-body { display: grid; padding: .85rem; gap: .65rem; border-top: 1px solid var(--border); }
+.parallel { grid-template-columns: repeat(auto-fit, minmax(min(13rem, 100%), 1fr)); }
+.stage { min-width: 0; padding: .65rem; background: var(--panel-raised); border-radius: .4rem; }
+.stage h3 + * { margin-top: .4rem; }
+.stage pre { margin-bottom: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.stage li { overflow-wrap: anywhere; }
+.tables { grid-template-columns: repeat(auto-fit, minmax(min(31rem, 100%), 1fr)); }
+.table-scroll { overflow: auto; }
+table { width: 100%; border-collapse: collapse; text-align: left; font-variant-numeric: tabular-nums; }
+th, td { padding: .6rem .75rem; border-bottom: 1px solid var(--border); }
+thead th { color: var(--muted); background: var(--panel-raised); font-size: .82rem; }
+tbody tr:last-child > * { border-bottom: 0; }
+time { white-space: nowrap; }
 
-dd {
-  font-size: 1.4rem;
-  font-weight: 650;
-  margin: .5rem 0 0;
-}
-
-.ready {
-  color: #81e5bf;
-}
-
-.updated {
-  font-size: .85rem;
-  font-variant-numeric: tabular-nums;
+@media (max-width: 38rem) {
+  .debate-title { display: inline; }
+  .debate-title .muted { display: block; margin: .35rem 0; }
 }

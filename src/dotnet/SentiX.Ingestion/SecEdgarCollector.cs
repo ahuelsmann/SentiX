@@ -118,7 +118,7 @@ public sealed partial class SecEdgarCollector(
         return delay > TimeSpan.FromDays(1) ? TimeSpan.FromDays(1) : delay;
     }
 
-    private static (MarketEvent Event, string RawPayload)? TryNormalize(XElement item, UniverseConfig universe)
+    internal static (MarketEvent Event, string RawPayload)? TryNormalize(XElement item, UniverseConfig universe)
     {
         var title = CleanText((string?)item.Element(Atom + "title"));
         string? form = item.Elements(Atom + "category").Select(e => (string?)e.Attribute("term"))
@@ -166,11 +166,24 @@ public sealed partial class SecEdgarCollector(
         }, SentiXJson.Options));
     }
 
+    private static readonly HashSet<string> CorporateSuffixes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Inc", "Corp", "Corporation", "Co", "Company", "Ltd", "LLC", "PLC", "NV", "SE", "AG",
+        "Holdings", "Group", "Technologies", "Platforms", "Systems"
+    };
+
     private static bool MatchesCompany(string company, string alias)
     {
+        var name = CompanyWords(company);
         var normalizedAlias = CompanyWords(alias);
-        return normalizedAlias.Length > 0 &&
-            (" " + CompanyWords(company) + " ").Contains(" " + normalizedAlias + " ", StringComparison.OrdinalIgnoreCase);
+        if (normalizedAlias.Length == 0 || !name.StartsWith(normalizedAlias, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return name.Length == normalizedAlias.Length ||
+            (name[normalizedAlias.Length] == ' ' &&
+                name[(normalizedAlias.Length + 1)..].Split(' ').All(CorporateSuffixes.Contains));
     }
 
     private static string CompanyWords(string value) => NonCompanyWord().Replace(value, " ").Trim();

@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text.Json;
+using System.Xml.Linq;
 using Microsoft.Extensions.Logging.Abstractions;
 using SentiX.Domain;
 using SentiX.Ingestion;
@@ -24,6 +25,27 @@ public sealed class Phase2IngestionTests
 
         await collector.StartAsync(CancellationToken.None);
         await collector.ExecuteTask!.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Theory]
+    [InlineData("Apple", true)]
+    [InlineData("Apple, Inc.", true)]
+    [InlineData("Apple Technologies LLC", true)]
+    [InlineData("Apple Hospitality REIT, Inc.", false)]
+    [InlineData("Red Apple Inc.", false)]
+    [InlineData("Appleton Inc.", false)]
+    public void SecMatchesCompanyAliasOnlyAtTheStartWithOptionalCorporateSuffixes(string company, bool expected)
+    {
+        XNamespace atom = "http://www.w3.org/2005/Atom";
+        var filing = new XElement(atom + "entry",
+            new XElement(atom + "title", $"8-K - {company} (0000320193) (Filer)"),
+            new XElement(atom + "category", new XAttribute("term", "8-K")),
+            new XElement(atom + "id", "urn:tag:sec.gov,2008:accession-number=0000320193-26-000001"),
+            new XElement(atom + "updated", "2026-06-04T15:00:00-04:00"));
+
+        var result = SecEdgarCollector.TryNormalize(filing, Universe);
+
+        Assert.Equal(expected, result is not null);
     }
 
     [Fact]
