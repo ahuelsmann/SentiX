@@ -16,6 +16,9 @@ public sealed class InMemoryMarketQuoteCache : IMarketQuoteCache
     public void Update(MarketQuoteSnapshot snapshot) =>
         quotes.AddOrUpdate(snapshot.Symbol.Trim(), snapshot,
             (_, existing) => snapshot.TimestampUtc >= existing.TimestampUtc ? snapshot : existing);
+
+    public IReadOnlyCollection<MarketQuoteSnapshot> GetAll() =>
+        quotes.Values.OrderBy(static q => q.Symbol, StringComparer.Ordinal).ToArray();
 }
 
 public sealed class AlpacaQuotesCollector(

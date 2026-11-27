@@ -39,7 +39,13 @@ public sealed class ScheduledEventsSyncWorker(
             try
             {
                 await pipeline.EnsureReadyAsync(stoppingToken);
-                await store.AddNewAsync(await FetchAsync(stoppingToken), stoppingToken);
+                var snapshot = await FetchSnapshotAsync(stoppingToken);
+                await store.ReplaceFinnhubWindowAsync(
+                    snapshot.FromDateUtc,
+                    snapshot.ToDateUtc,
+                    snapshot.Events,
+                    snapshot.IncludesEconomicCalendar,
+                    stoppingToken);
                 var now = clock.GetUtcNow();
                 delay = NextSyncUtc(now) - now;
                 retrySeconds = 30;
@@ -68,17 +74,28 @@ public sealed class ScheduledEventsSyncWorker(
         return next > now ? next : ToUtc(today.AddDays(1), SyncTime);
     }
 
-    internal async Task<IReadOnlyCollection<ScheduledEventRow>> FetchAsync(CancellationToken token)
+    internal sealed record CalendarSyncSnapshot(
+        DateTimeOffset FromDateUtc,
+        DateTimeOffset ToDateUtc,
+        IReadOnlyCollection<ScheduledEventRow> Events,
+        bool IncludesEconomicCalendar);
+
+    internal async Task<IReadOnlyCollection<ScheduledEventRow>> FetchAsync(CancellationToken token) =>
+        (await FetchSnapshotAsync(token)).Events;
+
+    internal async Task<CalendarSyncSnapshot> FetchSnapshotAsync(CancellationToken token)
     {
         var today = DateOnly.FromDateTime(TimeZoneInfo.ConvertTime(clock.GetUtcNow(), Eastern).DateTime);
         var end = today.AddDays(13);
+        var fromDateUtc = ToUtc(today, TimeOnly.MinValue);
+        var toDateUtc = ToUtc(end.AddDays(1), TimeOnly.MinValue);
         // Retrieve one calendar window and keep only configured names. This avoids
         // repeating the same endpoint request for each watchlist symbol.
         string range = FormattableString.Invariant($"from={today:yyyy-MM-dd}&to={end:yyyy-MM-dd}");
         var watched = universe.Watchlist.Select(entry => entry.Ticker.Trim())
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
         var events = new HashSet<ScheduledEventRow>();
-        var earnings = await ReadCalendarAsync<EarningsCalendar>($"earnings?{range}", optional: false, token);
+        var (earnings, _) = await ReadCalendarStatusAsync<EarningsCalendar>($"earnings?{range}", optional: false, token);
         foreach (var item in earnings?.EarningsCalendarEntries ?? [])
         {
             if (item is null || string.IsNullOrWhiteSpace(item.Symbol) || !watched.Contains(item.Symbol) ||
@@ -101,7 +118,7 @@ public sealed class ScheduledEventsSyncWorker(
             events.Add(new ScheduledEventRow(0, "EARNINGS", symbol, $"{symbol} Earnings", ToUtc(date, time), "FINNHUB", default));
         }
 
-        var macro = await ReadCalendarAsync<EconomicCalendar>($"economic?{range}", optional: true, token);
+        var (macro, macroAvailable) = await ReadCalendarStatusAsync<EconomicCalendar>($"economic?{range}", optional: true, token);
         foreach (var item in macro?.EconomicCalendarEntries ?? [])
         {
             if (item is null || !string.Equals(item.Country, "US", StringComparison.OrdinalIgnoreCase) ||
@@ -120,10 +137,14 @@ public sealed class ScheduledEventsSyncWorker(
             }
         }
 
-        return events;
+        bool includesEconomicCalendar = macroAvailable && macro is not null;
+        return new CalendarSyncSnapshot(fromDateUtc, toDateUtc, events, includesEconomicCalendar);
     }
 
-    private async Task<T?> ReadCalendarAsync<T>(string endpoint, bool optional, CancellationToken token)
+    private async Task<(T? Payload, bool Available)> ReadCalendarStatusAsync<T>(
+        string endpoint,
+        bool optional,
+        CancellationToken token)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, BaseUrl + endpoint);
         request.Headers.Add("X-Finnhub-Token", options.ApiKey!.Trim());
@@ -131,11 +152,12 @@ public sealed class ScheduledEventsSyncWorker(
         if (optional && response.StatusCode is HttpStatusCode.Forbidden or HttpStatusCode.NotFound)
         {
             logger.LogInformation("Finnhub economic calendar is unavailable to this account.");
-            return default;
+            return (default, false);
         }
 
         response.EnsureSuccessStatusCode();
-        return await response.Content.ReadFromJsonAsync<T>(cancellationToken: token);
+        var payload = await response.Content.ReadFromJsonAsync<T>(cancellationToken: token);
+        return (payload, payload is not null);
     }
 
     private static string ClassifyMacro(string title)

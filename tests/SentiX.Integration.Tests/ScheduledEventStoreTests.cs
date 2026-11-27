@@ -10,13 +10,25 @@ public sealed class ScheduledEventStoreTests
     public async Task ConcurrentCalendarSyncsPersistEachNaturalKeyOnce()
     {
         var dbName = $"sentix_calendar_{Guid.NewGuid():N}";
-        var connection = new NpgsqlConnectionStringBuilder
-        {
-            Host = Environment.GetEnvironmentVariable(LocalPostgresFactAttribute.SocketVariable),
-            Username = "postgres",
-            Database = "postgres",
-            Pooling = false
-        };
+        var socketOrHost = Environment.GetEnvironmentVariable(LocalPostgresFactAttribute.SocketVariable);
+        var tcpHost = Environment.GetEnvironmentVariable(LocalPostgresFactAttribute.HostVariable);
+        var connection = !string.IsNullOrWhiteSpace(socketOrHost)
+            ? new NpgsqlConnectionStringBuilder
+            {
+                Host = socketOrHost,
+                Username = "postgres",
+                Database = "postgres",
+                Pooling = false
+            }
+            : new NpgsqlConnectionStringBuilder
+            {
+                Host = tcpHost,
+                Port = int.TryParse(Environment.GetEnvironmentVariable(LocalPostgresFactAttribute.PortVariable), out var port) ? port : 5432,
+                Username = Environment.GetEnvironmentVariable(LocalPostgresFactAttribute.UserVariable) ?? "postgres",
+                Password = Environment.GetEnvironmentVariable(LocalPostgresFactAttribute.PasswordVariable) ?? "postgres",
+                Database = "postgres",
+                Pooling = false
+            };
         await using var admin = new NpgsqlConnection(connection.ConnectionString);
         await admin.OpenAsync();
         await using (var create = new NpgsqlCommand($"CREATE DATABASE {dbName}", admin))
@@ -101,15 +113,25 @@ public sealed class ScheduledEventStoreTests
 internal sealed class LocalPostgresFactAttribute : FactAttribute
 {
     public const string SocketVariable = "SENTIX_TEST_POSTGRES_SOCKET";
+    public const string HostVariable = "SENTIX_TEST_POSTGRES_HOST";
+    public const string PortVariable = "SENTIX_TEST_POSTGRES_PORT";
+    public const string UserVariable = "SENTIX_TEST_POSTGRES_USER";
+    public const string PasswordVariable = "SENTIX_TEST_POSTGRES_PASSWORD";
 
     public LocalPostgresFactAttribute()
     {
         var socketDirectory = Environment.GetEnvironmentVariable(SocketVariable);
+        var hostConfigured = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(HostVariable));
+        if (hostConfigured)
+        {
+            return;
+        }
+
         if (!OperatingSystem.IsLinux() || socketDirectory is null ||
             !socketDirectory.StartsWith('/') || socketDirectory.IndexOfAny([',', ':']) >= 0 ||
             !Directory.Exists(socketDirectory))
         {
-            Skip = $"Set {SocketVariable} to a local PostgreSQL 17 Unix socket directory to run this test.";
+            Skip = $"Set {SocketVariable} or {HostVariable} to a PostgreSQL 17 instance to run this test.";
         }
     }
 }
