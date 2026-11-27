@@ -23,7 +23,8 @@ public sealed class HostTests
                 ["Alpaca:ApiKey"] = "PK_YOUR_PAPER_KEY",
                 ["Alpaca:SecretKey"] = "YOUR_PAPER_SECRET",
                 ["X:BearerToken"] = "",
-                ["Finnhub:ApiKey"] = "placeholder"
+                ["Finnhub:ApiKey"] = "placeholder",
+                ["Sec:UserAgent"] = "disabled"
             })));
         using var client = factory.CreateClient();
         using var response = await client.GetAsync("/health");
@@ -33,11 +34,14 @@ public sealed class HostTests
         using var payload = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         Assert.Equal("ok", payload.RootElement.GetProperty("status").GetString());
         Assert.Equal("unavailable", payload.RootElement.GetProperty("native").GetString());
-        Assert.Equal(1, payload.RootElement.GetProperty("phase").GetInt32());
+        Assert.Equal(2, payload.RootElement.GetProperty("phase").GetInt32());
         Assert.False(payload.RootElement.GetProperty("tradingEnabled").GetBoolean());
 
         var workers = factory.Services.GetServices<IHostedService>().OfType<BackgroundService>().ToArray();
         await Assert.Single(workers.OfType<AlpacaNewsCollector>()).ExecuteTask!.WaitAsync(TimeSpan.FromSeconds(5));
         await Assert.Single(workers.OfType<XIngestionWorker>()).ExecuteTask!.WaitAsync(TimeSpan.FromSeconds(5));
+        await Assert.Single(workers.OfType<SecEdgarCollector>()).ExecuteTask!.WaitAsync(TimeSpan.FromSeconds(5));
+        await Assert.Single(workers.OfType<ScheduledEventsSyncWorker>()).ExecuteTask!.WaitAsync(TimeSpan.FromSeconds(5));
+        await Assert.Single(workers.OfType<AlpacaQuotesCollector>()).ExecuteTask!.WaitAsync(TimeSpan.FromSeconds(5));
     }
 }
