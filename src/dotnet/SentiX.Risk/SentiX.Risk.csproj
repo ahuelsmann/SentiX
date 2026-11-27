@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    SentiX.Risk — deterministic Tier-2 Hard-Risk-Manager (specs/004-risk-guardrails.md).
+    Non-negotiable: zero ProjectReferences, zero NuGet dependencies, 0 % AI, no I/O, no ambient clock.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>SentiX.Risk</RootNamespace>
+    <AssemblyName>SentiX.Risk</AssemblyName>
+    <LangVersion>latest</LangVersion>
+    <Deterministic>true</Deterministic>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="SentiX.Risk.Tests" />
+  </ItemGroup>
+
+</Project>
