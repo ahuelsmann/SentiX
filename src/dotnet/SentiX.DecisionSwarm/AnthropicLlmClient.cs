@@ -14,6 +14,7 @@ namespace SentiX.DecisionSwarm;
 public sealed class AnthropicLlmClient : ILlmClient
 {
     public const string ApiVersion = "2023-06-01";
+    public const string StructuredOutputsBeta = "structured-outputs-2025-11-13";
     private const string ProviderName = "anthropic";
     private readonly HttpClient _http;
     private readonly LlmOptions _options;
@@ -48,14 +49,15 @@ public sealed class AnthropicLlmClient : ILlmClient
         var toolName = request.EffectiveSchemaName;
         if (structured)
         {
-            // Schema enforcement via a single forced tool call: the model MUST answer with tool_use input that
-            // conforms to the Spec 003 role schema.
+            // Schema enforcement via a single forced strict tool call: the model MUST answer with tool_use input
+            // that conforms to the Spec 003 role schema.
             payload["tools"] = new object[]
             {
                 new Dictionary<string, object>
                 {
                     ["name"] = toolName,
                     ["description"] = $"Emit the {request.Role} result as structured JSON conforming to the schema.",
+                    ["strict"] = true,
                     ["input_schema"] = LlmHttp.ParseSchema(request.JsonSchema!, ProviderName)
                 }
             };
@@ -68,6 +70,10 @@ public sealed class AnthropicLlmClient : ILlmClient
         };
         message.Headers.Add("x-api-key", tier.ApiKey);
         message.Headers.Add("anthropic-version", ApiVersion);
+        if (structured)
+        {
+            message.Headers.Add("anthropic-beta", StructuredOutputsBeta);
+        }
         message.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
         var body = await LlmHttp.SendAsync(_http, message, ProviderName, cancellationToken).ConfigureAwait(false);
@@ -80,7 +86,7 @@ public sealed class AnthropicLlmClient : ILlmClient
             throw new LlmResponseFormatException($"{ProviderName}: response has no content array.");
         }
 
-        var json = structured ? ExtractStructuredOutput(content, toolName) : ExtractText(content);
+        var json = structured ? ExtractToolInput(content, toolName) : ExtractText(content);
         root.TryGetProperty("usage", out var usage);
         var promptTokens = LlmHttp.ReadInt(usage, "input_tokens");
         var completionTokens = LlmHttp.ReadInt(usage, "output_tokens");
@@ -91,39 +97,30 @@ public sealed class AnthropicLlmClient : ILlmClient
     }
 
     /// <summary>
-    /// Schema mode: prefers the forced <c>tool_use</c> block's <c>input</c> object; if no <c>tool_use</c> block is
-    /// present, accepts a strict JSON <c>text</c> block only when no prose wraps it.
+    /// Schema mode: requires a matching forced <c>tool_use</c> block whose <c>input</c> is a JSON object. Plain
+    /// <c>text</c>-only fallback responses are rejected.
     /// </summary>
-    private static string ExtractStructuredOutput(JsonElement content, string toolName)
+    private static string ExtractToolInput(JsonElement content, string toolName)
     {
-        var sawToolUse = false;
         foreach (var block in content.EnumerateArray())
         {
             if (block.ValueKind == JsonValueKind.Object &&
                 block.TryGetProperty("type", out var type) && type.ValueKind == JsonValueKind.String &&
-                type.GetString() == "tool_use")
+                type.GetString() == "tool_use" &&
+                block.TryGetProperty("name", out var name) && name.ValueKind == JsonValueKind.String &&
+                name.GetString() == toolName &&
+                block.TryGetProperty("input", out var input))
             {
-                sawToolUse = true;
-                if (block.TryGetProperty("name", out var name) && name.ValueKind == JsonValueKind.String &&
-                    name.GetString() == toolName &&
-                    block.TryGetProperty("input", out var input))
+                if (input.ValueKind != JsonValueKind.Object)
                 {
-                    if (input.ValueKind != JsonValueKind.Object)
-                    {
-                        throw new LlmResponseFormatException($"{ProviderName}: tool_use input is not a JSON object.");
-                    }
-
-                    return LlmHttp.ExtractJsonObject(input.GetRawText());
+                    throw new LlmResponseFormatException($"{ProviderName}: tool_use input is not a JSON object.");
                 }
+
+                return LlmHttp.ExtractJsonObject(input.GetRawText());
             }
         }
 
-        if (sawToolUse)
-        {
-            throw new LlmResponseFormatException($"{ProviderName}: response has no forced tool_use block '{toolName}'.");
-        }
-
-        return ExtractText(content);
+        throw new LlmResponseFormatException($"{ProviderName}: response has no forced tool_use block '{toolName}'.");
     }
 
     /// <summary>Free-text mode: concatenated text blocks must be a pure JSON object (optionally in one clean fence).</summary>
