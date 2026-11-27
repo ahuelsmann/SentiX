@@ -17,16 +17,16 @@
     "SEMICONDUCTORS": "SMH"
   },
   "watchlist": [
-    { "ticker": "AAPL", "sector": "TECH", "aliases": ["Apple"] },
-    { "ticker": "MSFT", "sector": "TECH", "aliases": ["Microsoft"] },
-    { "ticker": "NVDA", "sector": "SEMICONDUCTORS", "aliases": ["Nvidia"] },
-    { "ticker": "AMD",  "sector": "SEMICONDUCTORS", "aliases": ["Advanced Micro Devices"] },
-    { "ticker": "AMZN", "sector": "CONSUMER_DISC", "aliases": ["Amazon"] },
-    { "ticker": "TSLA", "sector": "CONSUMER_DISC", "aliases": ["Tesla"] },
-    { "ticker": "XOM",  "sector": "ENERGY", "aliases": ["Exxon", "ExxonMobil"] },
-    { "ticker": "CVX",  "sector": "ENERGY", "aliases": ["Chevron"] },
-    { "ticker": "JPM",  "sector": "FINANCIALS", "aliases": ["JPMorgan", "JP Morgan"] },
-    { "ticker": "LMT",  "sector": "DEFENSE", "aliases": ["Lockheed Martin"] }
+    { "ticker": "AAPL", "cik": "0000320193", "sector": "TECH", "aliases": ["Apple"] },
+    { "ticker": "MSFT", "cik": "0000789019", "sector": "TECH", "aliases": ["Microsoft"] },
+    { "ticker": "NVDA", "cik": "0001045810", "sector": "SEMICONDUCTORS", "aliases": ["Nvidia"] },
+    { "ticker": "AMD",  "cik": "0000002488", "sector": "SEMICONDUCTORS", "aliases": ["Advanced Micro Devices"] },
+    { "ticker": "AMZN", "cik": "0001018724", "sector": "CONSUMER_DISC", "aliases": ["Amazon", "Amazon com", "Amazon.com"] },
+    { "ticker": "TSLA", "cik": "0001318605", "sector": "CONSUMER_DISC", "aliases": ["Tesla"] },
+    { "ticker": "XOM",  "cik": "0000034088", "sector": "ENERGY", "aliases": ["Exxon", "ExxonMobil", "Exxon Mobil"] },
+    { "ticker": "CVX",  "cik": "0000093410", "sector": "ENERGY", "aliases": ["Chevron"] },
+    { "ticker": "JPM",  "cik": "0000019617", "sector": "FINANCIALS", "aliases": ["JPMorgan", "JP Morgan", "JPMorgan Chase", "JPMorgan Chase & Co"] },
+    { "ticker": "LMT",  "cik": "0000936468", "sector": "DEFENSE", "aliases": ["Lockheed Martin"] }
   ],
   "socialAllowlist": [
     { "source": "SEC_EDGAR", "identifier": "FORM_8K", "trustTier": "PRIMARY" },
