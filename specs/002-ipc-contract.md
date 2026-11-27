@@ -157,3 +157,23 @@ Inside `sentix-native`, `SCORE_EVENT` executes deterministically in this order:
   - Text ticker matching requires uppercase tickers as written or `$TICKER` cashtags (case-insensitive), while watchlist `aliases` match case-insensitively.
   - Direct sector ETF ticker matches populate `matchedSectorEtfs` only; `benchmarkTicker` (`SPY`) never triggers `matchedTickers` or `matchedSectorEtfs`.
   - Pre-scoring drops (`SOURCE_NOT_ALLOWED`, `DUPLICATE`, `NO_WATCHLIST_MATCH`) emit `finbert: { positive: 0, negative: 0, neutral: 1, compositeScore: 0 }` and empty match lists (unless already populated prior to drop).
+
+## 7. Phase 2 Runtime Contract — ONNX-FinBERT INT8 (`T-07`)
+
+- **Environment Variables:**
+  - `SENTIX_ENGINE_MODE`: `"auto"` (default) | `"onnx"` | `"mock"`. Unknown values fail startup / enter `DEGRADED`.
+  - `SENTIX_MODEL_PATH`: default `/models/finbert-int8.onnx`.
+  - `SENTIX_VOCAB_PATH`: default `/models/vocab.txt`.
+  - `SENTIX_FINBERT_LABELS`: comma-separated 3-class logit order, default `positive,negative,neutral` (`ProsusAI/finbert` label mapping).
+  - `SENTIX_ONNX_INTRA_OP_THREADS`: optional integer >= `1` (default `1` or `2` for predictable low-jitter inference).
+- **Mode Semantics (Fail-Closed Guarantee):**
+  - `mock`: uses deterministic `MockSentimentEngine` (`modelLoaded: true`, `status: "READY"` once config is valid).
+  - `onnx`: strictly requires both `SENTIX_MODEL_PATH` and `SENTIX_VOCAB_PATH` to exist and load cleanly into ONNX Runtime + WordPiece vocab. If either is missing, unreadable, or corrupt -> `is_ready() == false`, `HEALTH_CHECK_ACK` reports `status: "DEGRADED"`, `modelLoaded: false`, and `SCORE_EVENT` returns `ERROR` with `code: "MODEL_NOT_READY"` (fail-closed, zero trades).
+  - `auto`: if both `SENTIX_MODEL_PATH` and `SENTIX_VOCAB_PATH` exist on disk -> initializes `OnnxFinbertSentimentEngine` (if loading/validation fails, stay fail-closed `DEGRADED` + `MODEL_NOT_READY` — NEVER silently downgrade a broken ONNX file to `mock`). Only when both paths are absent on disk does `auto` fall back to `MockSentimentEngine` (enabling clean CI execution without committing binary ONNX weights to Git).
+- **WordPiece Tokenizer & Tensor Contract (`OnnxFinbertSentimentEngine`):**
+  - Loads standard BERT `vocab.txt` (1 token per line, 0-based token IDs, `[UNK]`, `[CLS]`, `[SEP]`, `[PAD]`).
+  - Lowercases ASCII text, splits on whitespace and ASCII punctuation, greedily segments out-of-vocabulary words into WordPiece `##subwords` (emitting `[UNK]` when unmatchable or word exceeds 100 chars).
+  - Wraps token sequence as `[CLS] tokens... [SEP]` truncated to max `512` tokens (`input_ids`, `attention_mask`, and optional `token_type_ids` if required by the loaded ONNX graph inputs, `int64`).
+  - Extracts `[1, 3]` output logits, applies numerically stable softmax (`max`-shifted `exp`), maps indices via `SENTIX_FINBERT_LABELS` so `positive + negative + neutral == 1.0` and `compositeScore = positive - negative` in `[-1.0, +1.0]`.
+- **Build Flag & Zero-Cost CI:**
+  - `CMakeLists.txt` exposes `option(SENTIX_ENABLE_ONNX "Enable ONNX Runtime C++ inference engine" ON)`. When `ON`, CMake discovers pre-installed `onnxruntime` OR downloads a pinned official `onnxruntime-linux-x64` release archive with SHA-256 verification cleanly via `FetchContent`. When `OFF`, compiles purely with `MockSentimentEngine` (keeping `-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion -Wnon-virtual-dtor -Werror` 100 % clean).
