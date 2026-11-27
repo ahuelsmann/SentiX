@@ -1,0 +1,9 @@
+**
+!src/
+!src/native/
+!src/native/**
+**/build/
+**/cmake-build-*/
+**/.env
+**/.env.*
+**/X.txt
