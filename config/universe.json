@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "maxEquitiesWsSymbols": 30,
+  "fastPath": {
+    "minAbsCompositeScore": 0.55,
+    "dedupWindowMinutes": 180
+  },
+  "benchmarkTicker": "SPY",
+  "sectorEtfs": {
+    "TECH": "XLK",
+    "ENERGY": "XLE",
+    "FINANCIALS": "XLF",
+    "HEALTHCARE": "XLV",
+    "INDUSTRIALS": "XLI",
+    "DEFENSE": "ITA",
+    "CONSUMER_DISC": "XLY",
+    "SEMICONDUCTORS": "SMH"
+  },
+  "watchlist": [
+    { "ticker": "AAPL", "sector": "TECH", "aliases": ["Apple"] },
+    { "ticker": "MSFT", "sector": "TECH", "aliases": ["Microsoft"] },
+    { "ticker": "NVDA", "sector": "SEMICONDUCTORS", "aliases": ["Nvidia"] },
+    { "ticker": "AMD",  "sector": "SEMICONDUCTORS", "aliases": ["Advanced Micro Devices"] },
+    { "ticker": "AMZN", "sector": "CONSUMER_DISC", "aliases": ["Amazon"] },
+    { "ticker": "TSLA", "sector": "CONSUMER_DISC", "aliases": ["Tesla"] },
+    { "ticker": "XOM",  "sector": "ENERGY", "aliases": ["Exxon", "ExxonMobil"] },
+    { "ticker": "CVX",  "sector": "ENERGY", "aliases": ["Chevron"] },
+    { "ticker": "JPM",  "sector": "FINANCIALS", "aliases": ["JPMorgan", "JP Morgan"] },
+    { "ticker": "LMT",  "sector": "DEFENSE", "aliases": ["Lockheed Martin"] }
+  ],
+  "socialAllowlist": [
+    { "source": "SEC_EDGAR", "identifier": "FORM_8K", "trustTier": "PRIMARY" },
+    { "source": "ALPACA_BENZINGA", "identifier": "NEWSWIRE", "trustTier": "PRIMARY" },
+    { "source": "X_ALLOWLIST", "identifier": "realDonaldTrump", "trustTier": "VERIFIED_SOCIAL" },
+    { "source": "X_ALLOWLIST", "identifier": "WhiteHouse", "trustTier": "PRIMARY" },
+    { "source": "X_ALLOWLIST", "identifier": "federalreserve", "trustTier": "PRIMARY" },
+    { "source": "X_ALLOWLIST", "identifier": "SECGov", "trustTier": "PRIMARY" },
+    { "source": "X_ALLOWLIST", "identifier": "USTreasury", "trustTier": "PRIMARY" }
+  ]
+}

@@ -1,0 +1,65 @@
+services:
+  sentix-db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: sentix
+      POSTGRES_USER: sentix
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentix"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  sentix-native:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.native
+    restart: unless-stopped
+    environment:
+      SENTIX_SOCKET_PATH: /run/sentix/native.sock
+      SENTIX_CONFIG_PATH: /config/universe.json
+      SENTIX_ONNX_MODEL: /models/finbert-int8.onnx
+    volumes:
+      - ipc_socket:/run/sentix
+      - ./config:/config:ro
+      - ./models:/models:ro
+
+  sentix-host:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.host
+    restart: unless-stopped
+    depends_on:
+      sentix-db:
+        condition: service_healthy
+      sentix-native:
+        condition: service_started
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      ConnectionStrings__Default: Host=sentix-db;Database=sentix;Username=sentix;Password=${POSTGRES_PASSWORD}
+      Sentix__NativeSocketPath: /run/sentix/native.sock
+      Sentix__ConfigPath: /config/universe.json
+      Alpaca__PaperMode: "true"
+      Alpaca__AllowShorting: ${ALPACA_ALLOW_SHORTING:-false}
+      Alpaca__ApiKey: ${ALPACA_API_KEY}
+      Alpaca__SecretKey: ${ALPACA_SECRET_KEY}
+      X__BearerToken: ${X_BEARER_TOKEN:-}
+      X__DailyPostCap: ${X_DAILY_POST_CAP:-150}
+      Finnhub__ApiKey: ${FINNHUB_API_KEY:-}
+    volumes:
+      - ipc_socket:/run/sentix
+      - ./config:/config:ro
+
+volumes:
+  pgdata:
+  ipc_socket:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs

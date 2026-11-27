@@ -424,3 +424,27 @@ FodyWeavers.xsd
 
 # Official VS Code C# Dev Kit Extension exclusion
 #*.lscache
+
+# SentiX Secrets & Runtime Overrides (NEVER commit)
+.env
+.env.*
+!.env.example
+X.txt
+
+# SentiX Native C++ Build & Coverage Artifacts
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.gcda
+*.gcno
+coverage.cobertura.xml
+
+# SentiX IPC & ONNX Models
+*.sock
+models/*.onnx
+
+# SentiX Web Frontend
+src/web/node_modules/
+src/web/dist/
