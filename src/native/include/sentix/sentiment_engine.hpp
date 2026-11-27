@@ -1,8 +1,11 @@
 // SentiX native fast-path — sentiment engine abstraction (specs/002 §5 check 4).
-// Phase 1: deterministic lexicon mock. Phase 2: ONNX-FinBERT INT8 behind the same interface.
+// Phase 1: deterministic lexicon mock. Phase 2: ONNX-FinBERT INT8 behind the same interface
+// (see onnx_finbert_engine.hpp and engine_factory.hpp, specs/002 §7).
 #pragma once
 
+#include <string>
 #include <string_view>
+#include <utility>
 
 namespace sentix::sentiment {
 
@@ -36,6 +39,22 @@ public:
     [[nodiscard]] SentimentScores score(std::string_view text) override;
     [[nodiscard]] bool is_ready() const noexcept override { return true; }
     [[nodiscard]] std::string_view name() const noexcept override { return "mock-lexicon-v1"; }
+};
+
+/// Fail-closed placeholder used when the configured engine could not be initialized (e.g. SENTIX_ENGINE_MODE=onnx
+/// with a missing/corrupt model). Never ready, so the daemon reports DEGRADED and SCORE_EVENT -> MODEL_NOT_READY.
+class UnavailableSentimentEngine final : public ISentimentEngine {
+public:
+    explicit UnavailableSentimentEngine(std::string reason) : reason_(std::move(reason)) {}
+
+    /// Always throws std::logic_error: callers must check is_ready() first.
+    [[nodiscard]] SentimentScores score(std::string_view text) override;
+    [[nodiscard]] bool is_ready() const noexcept override { return false; }
+    [[nodiscard]] std::string_view name() const noexcept override { return "unavailable"; }
+    [[nodiscard]] const std::string& reason() const noexcept { return reason_; }
+
+private:
+    std::string reason_;
 };
 
 }  // namespace sentix::sentiment

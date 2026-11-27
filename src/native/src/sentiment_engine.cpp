@@ -1,6 +1,7 @@
 #include "sentix/sentiment_engine.hpp"
 
 #include <array>
+#include <stdexcept>
 #include <string>
 
 #include "sentix/text_cleaner.hpp"
@@ -69,6 +70,10 @@ SentimentScores MockSentimentEngine::score(std::string_view text) {
     scores.neutral = 1.0 - scores.positive - scores.negative;
     scores.compositeScore = scores.positive - scores.negative;
     return scores;
+}
+
+SentimentScores UnavailableSentimentEngine::score(std::string_view /*text*/) {
+    throw std::logic_error("sentiment engine unavailable: " + reason_);
 }
 
 }  // namespace sentix::sentiment
