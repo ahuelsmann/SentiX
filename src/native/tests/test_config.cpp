@@ -39,7 +39,7 @@ TEST(Config, LoadsRepositoryUniverseJson) {
     EXPECT_EQ(cfg.socialAllowlist.size(), 7U);
     EXPECT_EQ(cfg.sectorEtfs.at("SEMICONDUCTORS"), "SMH");
     EXPECT_EQ(cfg.watchlist[8].ticker, "JPM");
-    EXPECT_EQ(cfg.watchlist[8].aliases, (std::vector<std::string>{"JPMorgan", "JP Morgan"}));
+    EXPECT_EQ(cfg.watchlist[8].aliases, (std::vector<std::string>{"JPMorgan", "JP Morgan", "JPMorgan Chase", "JPMorgan Chase & Co"}));
     EXPECT_EQ(cfg.socialAllowlist[2].source, "X_ALLOWLIST");
     EXPECT_EQ(cfg.socialAllowlist[2].identifier, "realDonaldTrump");
     EXPECT_EQ(cfg.socialAllowlist[2].trustTier, "VERIFIED_SOCIAL");
