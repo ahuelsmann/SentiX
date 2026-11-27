@@ -56,8 +56,8 @@
 
 ## 4. Phase 2.1 Follow-ups (`M1`, `M2`, `M3` in `T-11` / `T-12`)
 
-- **M1 (`SecEdgarCollector`):** Company-name alias matching MUST prevent substring company-type false positives (e.g., `"Apple Hospitality REIT, Inc."` must NOT match `AAPL` unless the alias is matched cleanly at end-of-name or immediately followed by standard corporate suffix tokens such as `Inc`, `Corp`, `Corporation`, `Co`, `Company`, `Ltd`, `LLC`, `PLC`, `NV`, `SE`, `AG`, `Holdings`, `Group`, `Technologies`, `Platforms`, `Systems`).
-- **M2 (`ScheduledEventStore`):** Finnhub sync MUST upsert/replace rescheduled events cleanly within the synced `(fromDate, toDate)` window (updating existing session/timestamp changes cleanly and removing stale future Finnhub rows no longer returned for a ticker in that window) while refreshing `synced_at_utc`.
+- **M1 (`SecEdgarCollector`):** Watchlist matching MUST match official SEC CIK numbers (in `config/universe.json`) OR company-name aliases while preventing false positives like `"Apple Hospitality REIT, Inc."` (and MUST keep matching real EDGAR filer names such as `"AMAZON COM INC"`, `"EXXON MOBIL CORP"`, `"JPMORGAN CHASE & CO"`).
+- **M2 (`ScheduledEventStore`):** Finnhub sync MUST upsert/replace rescheduled events cleanly within the synced `(fromDate, toDate)` window (`T-11` provides `ReplaceFinnhubWindowAsync`, and `T-12` wires `ScheduledEventsSyncWorker` to call it while refreshing `synced_at_utc`).
 - **M3 (`ci.yml`):** Wire a PostgreSQL 17 service container into `.github/workflows/ci.yml` so `ScheduledEventStoreTests` and Phase 3 debate persistence integration tests execute live on every CI push.
 
 ## 5. React Shadow Cockpit (`src/web/`, `T-11`)
