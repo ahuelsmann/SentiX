@@ -1,9 +1,13 @@
 // sentix-native — SentiX C++20 fast-path daemon (specs/002-ipc-contract.md).
 //
 // Environment:
-//   SENTIX_SOCKET_PATH  Unix domain socket path   (default /run/sentix/native.sock)
-//   SENTIX_CONFIG_PATH  universe.json path        (default /config/universe.json)
-//   SENTIX_ONNX_MODEL   reserved for Phase 2 ONNX-FinBERT (ignored by the Phase-1 mock engine)
+//   SENTIX_SOCKET_PATH            Unix domain socket path   (default /run/sentix/native.sock)
+//   SENTIX_CONFIG_PATH            universe.json path        (default /config/universe.json)
+//   SENTIX_ENGINE_MODE            auto | onnx | mock        (default auto, specs/002 §7)
+//   SENTIX_MODEL_PATH             ONNX-FinBERT INT8 model   (default /models/finbert-int8.onnx)
+//   SENTIX_VOCAB_PATH             WordPiece vocab.txt       (default /models/vocab.txt)
+//   SENTIX_FINBERT_LABELS         logit order               (default positive,negative,neutral)
+//   SENTIX_ONNX_INTRA_OP_THREADS  ONNX Runtime threads >= 1 (default 1)
 
 #include <atomic>
 #include <csignal>
@@ -13,10 +17,12 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include "sentix/config.hpp"
+#include "sentix/engine_config.hpp"
+#include "sentix/engine_factory.hpp"
 #include "sentix/protocol.hpp"
-#include "sentix/sentiment_engine.hpp"
 #include "sentix/unix_socket_server.hpp"
 
 namespace {
@@ -67,9 +73,13 @@ int main(int argc, char** argv) {
     install_signal_handlers();
 
     try {
-        sentix::protocol::RequestHandler handler(configPath, std::make_unique<sentix::sentiment::MockSentimentEngine>());
+        auto selection = sentix::engine::create_sentiment_engine(sentix::engine::load_engine_settings_from_environment());
+        log(selection.ready() ? "INFO" : "ERROR", selection.description);
+
+        sentix::protocol::RequestHandler handler(configPath, std::move(selection.engine));
         if (handler.load_initial_config()) {
-            log("INFO", "universe loaded from " + configPath + " - status READY");
+            log(handler.status() == sentix::protocol::EngineStatus::Ready ? "INFO" : "ERROR",
+                "universe loaded from " + configPath + " - status " + std::string(sentix::protocol::to_string(handler.status())));
         } else {
             log("WARN", "universe config unavailable at " + configPath + " - status DEGRADED (fail-closed, awaiting RELOAD_CONFIG)");
         }

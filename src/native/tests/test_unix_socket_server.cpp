@@ -5,7 +5,10 @@
 #include <csignal>
 #include <filesystem>
 #include <memory>
+#include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 #include <sys/socket.h>
@@ -314,6 +317,7 @@ TEST(SentixNativeBinary, ServesHealthAndUnlinksSocketOnSigterm) {
     if (pid == 0) {
         ::setenv("SENTIX_SOCKET_PATH", socketPath.c_str(), 1);
         ::setenv("SENTIX_CONFIG_PATH", configPath.c_str(), 1);
+        ::setenv("SENTIX_ENGINE_MODE", "mock", 1);  // independent of any /models present on the host
         ::execl(SENTIX_NATIVE_BINARY, "sentix-native", static_cast<char*>(nullptr));
         ::_exit(127);
     }
@@ -368,3 +372,64 @@ TEST(SentixNativeBinary, StartsDegradedWithoutConfigAndFailsClosed) {
     EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     EXPECT_FALSE(std::filesystem::exists(socketPath));
 }
+
+namespace {
+
+/// Starts the real daemon with a valid universe and the given engine environment, then asserts the
+/// specs/002 §7 fail-closed contract: HEALTH_CHECK_ACK DEGRADED + modelLoaded=false, SCORE_EVENT -> MODEL_NOT_READY.
+void expect_binary_fails_closed(const std::vector<std::pair<std::string, std::string>>& engineEnv) {
+    sentix::testing::TempDir dir;
+    const auto configPath = dir.write("universe.json", sentix::testing::read_file(sentix::testing::universe_json_path()));
+    const auto socketPath = dir.path() / "native.sock";
+
+    const pid_t pid = ::fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+        ::setenv("SENTIX_SOCKET_PATH", socketPath.c_str(), 1);
+        ::setenv("SENTIX_CONFIG_PATH", configPath.c_str(), 1);
+        for (const auto& [name, value] : engineEnv) {
+            ::setenv(name.c_str(), value.c_str(), 1);
+        }
+        ::execl(SENTIX_NATIVE_BINARY, "sentix-native", static_cast<char*>(nullptr));
+        ::_exit(127);
+    }
+
+    Fd client;
+    for (int i = 0; i < 100 && client.get() < 0; ++i) {
+        std::this_thread::sleep_for(20ms);
+        client = connect_unix(socketPath.string());
+    }
+    ASSERT_GE(client.get(), 0);
+    const auto health = roundtrip(client.get(), envelope("HEALTH_CHECK"));
+    ASSERT_FALSE(health.is_null());
+    EXPECT_EQ(health.at("payload").at("status"), "DEGRADED");
+    EXPECT_EQ(health.at("payload").at("modelLoaded"), false);
+    const auto score = roundtrip(client.get(), envelope("SCORE_EVENT", market_event("e1", "Apple beats record", "", "", "ALPACA_BENZINGA",
+                                                                                     "Benzinga", nlohmann::json::array({"AAPL"}))));
+    ASSERT_FALSE(score.is_null());
+    EXPECT_EQ(score.at("type"), "ERROR");
+    EXPECT_EQ(score.at("payload").at("code"), "MODEL_NOT_READY");
+
+    ASSERT_EQ(::kill(pid, SIGTERM), 0);
+    int status = 0;
+    ASSERT_EQ(::waitpid(pid, &status, 0), pid);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+}  // namespace
+
+TEST(SentixNativeBinary, OnnxModeWithMissingModelFailsClosed) {
+    sentix::testing::TempDir models;
+    expect_binary_fails_closed({{"SENTIX_ENGINE_MODE", "onnx"},
+                                {"SENTIX_MODEL_PATH", (models.path() / "finbert-int8.onnx").string()},
+                                {"SENTIX_VOCAB_PATH", (models.path() / "vocab.txt").string()}});
+}
+
+TEST(SentixNativeBinary, AutoModeWithCorruptModelFailsClosed) {
+    sentix::testing::TempDir models;
+    const auto model = models.write("finbert-int8.onnx", "corrupt");
+    const auto vocab = models.write("vocab.txt", "[PAD]\n[UNK]\n[CLS]\n[SEP]\n");
+    expect_binary_fails_closed({{"SENTIX_ENGINE_MODE", "auto"}, {"SENTIX_MODEL_PATH", model.string()}, {"SENTIX_VOCAB_PATH", vocab.string()}});
+}
+
+TEST(SentixNativeBinary, UnknownEngineModeFailsClosed) { expect_binary_fails_closed({{"SENTIX_ENGINE_MODE", "turbo"}}); }

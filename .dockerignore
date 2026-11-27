@@ -1,0 +1,7 @@
+.git
+artifacts/
+TestResults/
+build/
+**/bin/
+**/obj/
+src/web/node_modules/

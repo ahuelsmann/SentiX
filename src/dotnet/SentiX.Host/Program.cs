@@ -60,6 +60,28 @@ builder.Services.AddSingleton<IMarketEventPipeline>(services => new MarketEventP
     services.GetRequiredService<ILogger<MarketEventPipeline>>(),
     !string.IsNullOrWhiteSpace(services.GetRequiredService<IConfiguration>().GetConnectionString("Default"))));
 
+builder.Services.AddSingleton(services =>
+{
+    var config = services.GetRequiredService<IConfiguration>();
+    return new SecOptions(
+        config["Sec:UserAgent"] ?? config["SEC_USER_AGENT"],
+        config.GetValue<int?>("Sec:PollIntervalSeconds") ?? config.GetValue("SEC_POLL_INTERVAL_SECONDS", 30));
+});
+
+builder.Services.AddSingleton<IMarketQuoteCache, InMemoryMarketQuoteCache>();
+builder.Services.AddSingleton<ScheduledEventStore>();
+builder.Services.AddHttpClient<SecEdgarCollector>().ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+{
+    AllowAutoRedirect = false,
+    AutomaticDecompression = System.Net.DecompressionMethods.All
+});
+builder.Services.AddHttpClient<ScheduledEventsSyncWorker>().ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+{
+    AllowAutoRedirect = false
+});
+builder.Services.AddHostedService(services => services.GetRequiredService<SecEdgarCollector>());
+builder.Services.AddHostedService(services => services.GetRequiredService<ScheduledEventsSyncWorker>());
+builder.Services.AddHostedService<AlpacaQuotesCollector>();
 builder.Services.AddHostedService<AlpacaNewsCollector>();
 builder.Services.AddHttpClient("XFilteredStream", http => http.Timeout = Timeout.InfiniteTimeSpan);
 builder.Services.AddHostedService(services => new XIngestionWorker(
@@ -88,7 +110,7 @@ app.MapGet("/health", async (NativeBridgeClient bridge, HttpContext context) =>
     {
         status = "ok",
         native = nativeStatus,
-        phase = 1,
+        phase = 2,
         tradingEnabled = false
     });
 });

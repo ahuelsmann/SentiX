@@ -112,7 +112,7 @@ public sealed class AlpacaNewsCollector(
         }
     }
 
-    private static async Task ExpectAsync(ClientWebSocket socket, string type, string message, CancellationToken token)
+    internal static async Task ExpectAsync(ClientWebSocket socket, string type, string message, CancellationToken token)
     {
         while (true)
         {
@@ -129,11 +129,11 @@ public sealed class AlpacaNewsCollector(
         }
     }
 
-    private static string? ReadType(JsonElement item) =>
+    internal static string? ReadType(JsonElement item) =>
         item.ValueKind == JsonValueKind.Object && item.TryGetProperty("T", out var type) &&
         type.ValueKind == JsonValueKind.String ? type.GetString() : null;
 
-    private static void RejectServerError(JsonElement item)
+    internal static void RejectServerError(JsonElement item)
     {
         if (ReadType(item) == "error")
         {
@@ -141,7 +141,7 @@ public sealed class AlpacaNewsCollector(
         }
     }
 
-    private static async Task<JsonDocument> ReceiveAsync(ClientWebSocket socket, CancellationToken token)
+    internal static async Task<JsonDocument> ReceiveAsync(ClientWebSocket socket, CancellationToken token)
     {
         var message = new ArrayBufferWriter<byte>();
         ValueWebSocketReceiveResult result;
