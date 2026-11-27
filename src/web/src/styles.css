@@ -1,0 +1,78 @@
+:root {
+  font-family: system-ui, sans-serif;
+  color-scheme: dark;
+  color: #eef4f8;
+  background: #101821;
+  font-synthesis: none;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  width: min(58rem, 100% - 2.5rem);
+  margin: 0 auto;
+  padding: clamp(2.5rem, 8vw, 6rem) 0;
+}
+
+.product {
+  color: #81e5bf;
+  font-weight: 700;
+  letter-spacing: .08em;
+  margin: 0 0 .75rem;
+}
+
+h1 {
+  font-size: clamp(2rem, 7vw, 3.5rem);
+  line-height: 1.08;
+  letter-spacing: -.045em;
+  margin: 0;
+}
+
+.subtitle,
+.updated {
+  color: #aebfce;
+}
+
+section {
+  margin-top: 3rem;
+}
+
+h2 {
+  font-size: 1.125rem;
+}
+
+dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(12rem, 100%), 1fr));
+  gap: .75rem;
+  margin: 0;
+}
+
+.status {
+  padding: 1.25rem;
+  background: #17232e;
+  border: 1px solid #314354;
+  border-radius: .75rem;
+}
+
+dt {
+  color: #bfcfd9;
+  font-size: .9rem;
+}
+
+dd {
+  font-size: 1.4rem;
+  font-weight: 650;
+  margin: .5rem 0 0;
+}
+
+.ready {
+  color: #81e5bf;
+}
+
+.updated {
+  font-size: .85rem;
+  font-variant-numeric: tabular-nums;
+}

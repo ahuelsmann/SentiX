@@ -1,0 +1,30 @@
+FROM node:22-bookworm-slim AS web
+WORKDIR /web
+COPY src/web/package.json src/web/package-lock.json ./
+RUN npm ci
+COPY src/web/index.html src/web/tsconfig.json src/web/vite.config.ts ./
+COPY src/web/src/ ./src/
+RUN npm run build
+
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+WORKDIR /source
+COPY src/dotnet/SentiX.Domain/SentiX.Domain.csproj src/dotnet/SentiX.Domain/
+COPY src/dotnet/SentiX.Infrastructure/SentiX.Infrastructure.csproj src/dotnet/SentiX.Infrastructure/
+COPY src/dotnet/SentiX.NativeBridge/SentiX.NativeBridge.csproj src/dotnet/SentiX.NativeBridge/
+COPY src/dotnet/SentiX.Ingestion/SentiX.Ingestion.csproj src/dotnet/SentiX.Ingestion/
+COPY src/dotnet/SentiX.Host/SentiX.Host.csproj src/dotnet/SentiX.Host/
+COPY config/universe.json config/universe.json
+RUN dotnet restore src/dotnet/SentiX.Host/SentiX.Host.csproj
+COPY src/dotnet/SentiX.Domain/ src/dotnet/SentiX.Domain/
+COPY src/dotnet/SentiX.Infrastructure/ src/dotnet/SentiX.Infrastructure/
+COPY src/dotnet/SentiX.NativeBridge/ src/dotnet/SentiX.NativeBridge/
+COPY src/dotnet/SentiX.Ingestion/ src/dotnet/SentiX.Ingestion/
+COPY src/dotnet/SentiX.Host/ src/dotnet/SentiX.Host/
+COPY --from=web /web/dist/ src/dotnet/SentiX.Host/wwwroot/
+RUN dotnet publish src/dotnet/SentiX.Host/SentiX.Host.csproj -c Release -o /app
+
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
+WORKDIR /app
+COPY --from=build /app .
+EXPOSE 8080
+ENTRYPOINT ["dotnet", "SentiX.Host.dll"]
