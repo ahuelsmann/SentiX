@@ -12,4 +12,5 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libssl3t64 libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /source/build/native/sentix-native /usr/local/bin/sentix-native
+COPY --from=build /source/build/native/libonnxruntime*.so* /usr/local/bin/
 ENTRYPOINT ["/usr/local/bin/sentix-native"]
