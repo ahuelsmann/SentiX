@@ -38,6 +38,19 @@ jobs:
     name: .NET 10 Build, Unit, IPC & Docker Verification
     runs-on: ubuntu-24.04
     needs: [native]
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -53,9 +66,13 @@ jobs:
           name: sentix-native-linux
           path: build/native
 
-      - name: Build & test SentiX.slnx (incl. live sentix-native IPC E2E)
+      - name: Build & test SentiX.slnx (incl. live sentix-native IPC & Postgres 17 E2E)
         env:
           SENTIX_NATIVE_BIN: ${{ github.workspace }}/build/native/sentix-native
+          SENTIX_TEST_POSTGRES_HOST: 127.0.0.1
+          SENTIX_TEST_POSTGRES_PORT: 5432
+          SENTIX_TEST_POSTGRES_USER: postgres
+          SENTIX_TEST_POSTGRES_PASSWORD: postgres
         run: |
           chmod +x build/native/sentix-native
           dotnet build SentiX.slnx -c Release
@@ -92,7 +109,8 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install & build src/web
+      - name: Install, test & build src/web
         run: |
           npm --prefix src/web ci
+          npm --prefix src/web test
           npm --prefix src/web run build

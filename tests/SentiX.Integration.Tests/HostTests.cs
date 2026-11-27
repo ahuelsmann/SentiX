@@ -34,8 +34,9 @@ public sealed class HostTests
         using var payload = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         Assert.Equal("ok", payload.RootElement.GetProperty("status").GetString());
         Assert.Equal("unavailable", payload.RootElement.GetProperty("native").GetString());
-        Assert.Equal(2, payload.RootElement.GetProperty("phase").GetInt32());
+        Assert.Equal(3, payload.RootElement.GetProperty("phase").GetInt32());
         Assert.False(payload.RootElement.GetProperty("tradingEnabled").GetBoolean());
+        Assert.False(payload.RootElement.GetProperty("orderExecutionEnabled").GetBoolean());
 
         var workers = factory.Services.GetServices<IHostedService>().OfType<BackgroundService>().ToArray();
         await Assert.Single(workers.OfType<AlpacaNewsCollector>()).ExecuteTask!.WaitAsync(TimeSpan.FromSeconds(5));

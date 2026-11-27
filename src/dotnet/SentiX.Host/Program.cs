@@ -1,5 +1,7 @@
 using Microsoft.EntityFrameworkCore;
+using SentiX.DecisionSwarm;
 using SentiX.Domain;
+using SentiX.Host;
 using SentiX.Infrastructure;
 using SentiX.Ingestion;
 using SentiX.NativeBridge;
@@ -54,11 +56,18 @@ builder.Services.AddDbContextFactory<SentiXDbContext>((services, options) =>
     options.UseNpgsql(services.GetRequiredService<IConfiguration>().GetConnectionString("Default"),
         postgres => postgres.SetPostgresVersion(17, 0)));
 
+builder.Services.AddSingleton<IMarketQuoteCache, InMemoryMarketQuoteCache>();
+builder.Services.AddSentiXDecisionSwarm(builder.Configuration);
+
 builder.Services.AddSingleton<IMarketEventPipeline>(services => new MarketEventPipeline(
     services.GetRequiredService<IDbContextFactory<SentiXDbContext>>(),
     services.GetRequiredService<NativeBridgeClient>(),
     services.GetRequiredService<ILogger<MarketEventPipeline>>(),
-    !string.IsNullOrWhiteSpace(services.GetRequiredService<IConfiguration>().GetConnectionString("Default"))));
+    !string.IsNullOrWhiteSpace(services.GetRequiredService<IConfiguration>().GetConnectionString("Default")),
+    services.GetRequiredService<IDecisionSwarmOrchestrator>(),
+    services.GetRequiredService<IMarketQuoteCache>(),
+    services.GetRequiredService<UniverseConfig>(),
+    services.GetRequiredService<TimeProvider>()));
 
 builder.Services.AddSingleton(services =>
 {
@@ -68,7 +77,6 @@ builder.Services.AddSingleton(services =>
         config.GetValue<int?>("Sec:PollIntervalSeconds") ?? config.GetValue("SEC_POLL_INTERVAL_SECONDS", 30));
 });
 
-builder.Services.AddSingleton<IMarketQuoteCache, InMemoryMarketQuoteCache>();
 builder.Services.AddSingleton<ScheduledEventStore>();
 builder.Services.AddHttpClient<SecEdgarCollector>().ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
 {
@@ -95,25 +103,7 @@ builder.Services.AddHostedService(services => new XIngestionWorker(
 var app = builder.Build();
 _ = app.Services.GetRequiredService<UniverseConfig>();
 
-app.MapGet("/health", async (NativeBridgeClient bridge, HttpContext context) =>
-{
-    context.Response.Headers.CacheControl = "no-store";
-    var check = await bridge.HealthCheckAsync(context.RequestAborted);
-    string nativeStatus = check.Value switch
-    {
-        { Status: NativeStatus.Starting } => "starting",
-        { Status: NativeStatus.Degraded } or { ModelLoaded: false } => "degraded",
-        { Status: NativeStatus.Ready } when !check.IsFailClosed => "ready",
-        _ => "unavailable"
-    };
-    return Results.Ok(new
-    {
-        status = "ok",
-        native = nativeStatus,
-        phase = 2,
-        tradingEnabled = false
-    });
-});
+app.MapTelemetryEndpoints();
 
 if (app.Environment.WebRootFileProvider.GetFileInfo("index.html").Exists)
 {

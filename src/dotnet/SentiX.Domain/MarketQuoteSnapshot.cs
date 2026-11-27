@@ -7,4 +7,5 @@ public interface IMarketQuoteCache
 {
     bool TryGet(string symbol, out MarketQuoteSnapshot? snapshot);
     void Update(MarketQuoteSnapshot snapshot);
+    IReadOnlyCollection<MarketQuoteSnapshot> GetAll() => [];
 }

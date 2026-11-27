@@ -10,13 +10,25 @@ public sealed class ScheduledEventStoreTests
     public async Task ConcurrentCalendarSyncsPersistEachNaturalKeyOnce()
     {
         var dbName = $"sentix_calendar_{Guid.NewGuid():N}";
-        var connection = new NpgsqlConnectionStringBuilder
-        {
-            Host = Environment.GetEnvironmentVariable(LocalPostgresFactAttribute.SocketVariable),
-            Username = "postgres",
-            Database = "postgres",
-            Pooling = false
-        };
+        var socketOrHost = Environment.GetEnvironmentVariable(LocalPostgresFactAttribute.SocketVariable);
+        var tcpHost = Environment.GetEnvironmentVariable(LocalPostgresFactAttribute.HostVariable);
+        var connection = !string.IsNullOrWhiteSpace(socketOrHost)
+            ? new NpgsqlConnectionStringBuilder
+            {
+                Host = socketOrHost,
+                Username = "postgres",
+                Database = "postgres",
+                Pooling = false
+            }
+            : new NpgsqlConnectionStringBuilder
+            {
+                Host = tcpHost,
+                Port = int.TryParse(Environment.GetEnvironmentVariable(LocalPostgresFactAttribute.PortVariable), out var port) ? port : 5432,
+                Username = Environment.GetEnvironmentVariable(LocalPostgresFactAttribute.UserVariable) ?? "postgres",
+                Password = Environment.GetEnvironmentVariable(LocalPostgresFactAttribute.PasswordVariable) ?? "postgres",
+                Database = "postgres",
+                Pooling = false
+            };
         await using var admin = new NpgsqlConnection(connection.ConnectionString);
         await admin.OpenAsync();
         await using (var create = new NpgsqlCommand($"CREATE DATABASE {dbName}", admin))
@@ -49,6 +61,41 @@ public sealed class ScheduledEventStoreTests
             Assert.Single(saved, row => row.Ticker is null && row.EventType == "CPI");
             Assert.Single(saved, row => row.Ticker == "AAPL" && row.EventType == "EARNINGS");
             Assert.All(saved, row => Assert.Equal(timestamp, row.ScheduledAtUtc));
+
+            var nextSession = timestamp.AddDays(1).AddHours(6);
+            var rescheduled = snapshot[1] with { ScheduledAtUtc = nextSession };
+            var outside = snapshot[1] with { ScheduledAtUtc = timestamp.AddDays(-1) };
+            var otherSource = snapshot[1] with { Source = "OTHER" };
+            var missing = snapshot[1] with { Ticker = "MSFT", Title = "MSFT Earnings" };
+            await store.AddNewAsync([outside, otherSource, missing], CancellationToken.None);
+
+            await store.ReplaceFinnhubWindowAsync(timestamp, timestamp.AddDays(14), [rescheduled],
+                includesEconomicCalendar: false, CancellationToken.None);
+            var refreshed = await db.ScheduledEvents.AsNoTracking().ToArrayAsync();
+            Assert.DoesNotContain(refreshed, row => row.Ticker == "MSFT");
+            Assert.Contains(refreshed, row => row.Ticker is null && row.EventType == "CPI");
+            Assert.Contains(refreshed, row => row.Source == "OTHER");
+            Assert.Contains(refreshed, row => row.ScheduledAtUtc == outside.ScheduledAtUtc);
+            var moved = Assert.Single(refreshed, row => row.Source == "FINNHUB" && row.Ticker == "AAPL" &&
+                row.ScheduledAtUtc >= timestamp);
+            Assert.Equal(nextSession, moved.ScheduledAtUtc);
+            Assert.NotEqual(default, moved.SyncedAtUtc);
+
+            var priorSync = moved.SyncedAtUtc.AddDays(-1);
+            await db.ScheduledEvents.Where(row => row.Id == moved.Id)
+                .ExecuteUpdateAsync(setters => setters.SetProperty(row => row.SyncedAtUtc, priorSync));
+            await store.ReplaceFinnhubWindowAsync(timestamp, timestamp.AddDays(14), [rescheduled, rescheduled],
+                includesEconomicCalendar: false, CancellationToken.None);
+            var repeated = Assert.Single(await db.ScheduledEvents.AsNoTracking().ToArrayAsync(),
+                row => row.Source == "FINNHUB" && row.Ticker == "AAPL" && row.ScheduledAtUtc >= timestamp);
+            Assert.Equal(moved.Id, repeated.Id);
+            Assert.True(repeated.SyncedAtUtc > priorSync);
+
+            await store.ReplaceFinnhubWindowAsync(timestamp, timestamp.AddDays(14), [],
+                includesEconomicCalendar: true, CancellationToken.None);
+            var afterEmpty = await db.ScheduledEvents.AsNoTracking().ToArrayAsync();
+            Assert.Equal(2, afterEmpty.Length);
+            Assert.DoesNotContain(afterEmpty, row => row.Source == "FINNHUB" && row.ScheduledAtUtc >= timestamp);
         }
         finally
         {
@@ -66,15 +113,25 @@ public sealed class ScheduledEventStoreTests
 internal sealed class LocalPostgresFactAttribute : FactAttribute
 {
     public const string SocketVariable = "SENTIX_TEST_POSTGRES_SOCKET";
+    public const string HostVariable = "SENTIX_TEST_POSTGRES_HOST";
+    public const string PortVariable = "SENTIX_TEST_POSTGRES_PORT";
+    public const string UserVariable = "SENTIX_TEST_POSTGRES_USER";
+    public const string PasswordVariable = "SENTIX_TEST_POSTGRES_PASSWORD";
 
     public LocalPostgresFactAttribute()
     {
         var socketDirectory = Environment.GetEnvironmentVariable(SocketVariable);
+        var hostConfigured = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(HostVariable));
+        if (hostConfigured)
+        {
+            return;
+        }
+
         if (!OperatingSystem.IsLinux() || socketDirectory is null ||
             !socketDirectory.StartsWith('/') || socketDirectory.IndexOfAny([',', ':']) >= 0 ||
             !Directory.Exists(socketDirectory))
         {
-            Skip = $"Set {SocketVariable} to a local PostgreSQL 17 Unix socket directory to run this test.";
+            Skip = $"Set {SocketVariable} or {HostVariable} to a PostgreSQL 17 instance to run this test.";
         }
     }
 }

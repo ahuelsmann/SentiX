@@ -7,7 +7,9 @@
     <ItemGroup>
         <FrameworkReference Include="Microsoft.AspNetCore.App" />
         <ProjectReference Include="../SentiX.Domain/SentiX.Domain.csproj" />
+        <ProjectReference Include="../SentiX.DecisionSwarm/SentiX.DecisionSwarm.csproj" />
         <ProjectReference Include="../SentiX.Infrastructure/SentiX.Infrastructure.csproj" />
         <ProjectReference Include="../SentiX.NativeBridge/SentiX.NativeBridge.csproj" />
+        <ProjectReference Include="../SentiX.Risk/SentiX.Risk.csproj" />
     </ItemGroup>
 </Project>
