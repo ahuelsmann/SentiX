@@ -1,8 +1,0 @@
-Consumer Key 
-P3Gwzrdd6FuwcwTrnqg7XbfRs
-
-Secret
-2XeRu3hnZFCtI5d7WShqD2pE3dgQowooupcTGbS3BFerLwdOw7
-
-Bearer Token
-AAAAAAAAAAAAAAAAAAAAAOLtAQIAAAAAtDG2V5FwxBuNVo1OSPP6rFtoPus%3DeDSBykm4z0faHSJ8mZmsyk3iEDuY0tEZhUy6AAW5d85Dum42qu
