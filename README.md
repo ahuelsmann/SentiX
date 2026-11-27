@@ -2,7 +2,7 @@
 
 **SentiX** (`sentimentx.dev`) ist ein 24/7 laufendes, automatisiertes Handelssystem für hochliquide US-Aktien und Sektor-ETFs über die **Alpaca Trading API** (Paper Trading, Long-Only zum Start). Das System wertet Finanznachrichten, Pflichtmitteilungen (SEC EDGAR) und kuratierte Social-Media-Quellen in Echtzeit aus, um **Event-Driven Post-News-Drift** zu handeln und sich täglich am **SPY-Buy-and-Hold-Benchmark** zu messen.
 
-> **Status:** Phase 1 (Bootstrap & Fundament) — strikter **Paper-Trading- & Long-Only-Modus**. Die vollständige technische Spezifikation liegt in [`HANDOFF.md`](./HANDOFF.md).
+> **Status:** Phase 1 (Bootstrap & Fundament) — strikter **Paper-Trading- & Long-Only-Modus**. Die vollständige technische Spezifikation liegt in [`specs/`](./specs/) und [`AGENTS.md`](./AGENTS.md).
 
 ---
 
@@ -65,7 +65,6 @@ SentiX kombiniert eine latenzkritische **C++20/23-Engine** für das Rausch-Filte
 ```text
 SentiX/
 ├── AGENTS.md              # Multi-Agenten-Regeln & No-PR-Policy
-├── HANDOFF.md             # Master-Spezifikation (Single Source of Truth)
 ├── SentiX.slnx            # .NET 10 Solution
 ├── docker-compose.yml     # PostgreSQL 17 + sentix-native + sentix-host
 ├── .env.example           # Vorlage für API-Keys & Secrets
@@ -112,4 +111,4 @@ docker compose up -d --build
 - **Phase 3:** Decision-Swarm-Orchestrierung, Debatten-Persistenz & React-Dashboard im Shadow-Mode.
 - **Phase 4:** Alpaca Paper Execution (Bracket-Orders), UI-Kill-Switch und 4–8 Wochen Live-Paper-Test gegen SPY.
 
-**Git-Workflow:** Dieses Repository arbeitet strikt ohne GitHub Pull Requests (**No-PR-Policy**). Parallele Feature-Branches werden lokal geprüft, per `git merge --no-ff` in `main` integriert und direkt gepusht. Details siehe [`HANDOFF.md`](./HANDOFF.md).
+**Git-Workflow:** Dieses Repository arbeitet strikt ohne GitHub Pull Requests (**No-PR-Policy**). Parallele Feature-Branches werden lokal geprüft, per `git merge --no-ff` in `main` integriert und direkt gepusht. Details siehe [`AGENTS.md`](./AGENTS.md).

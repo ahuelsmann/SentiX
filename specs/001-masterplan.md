@@ -1,6 +1,6 @@
 # Spec 001 — SentiX Masterplan, ADRs, Pipeline & External Limits
 
-> Extracted from [`HANDOFF.md`](../HANDOFF.md) (Single Source of Truth, Stand 2026-11-26).
+> Single Source of Truth for SentiX architecture, ADRs, and limits (Stand 2026-11-26).
 
 ## 1. Mission & Strategy
 

@@ -1,6 +1,6 @@
 # AGENTS.md — SentiX Multi-Agent Operating Rules
 
-> **Sole Source of Truth:** [`HANDOFF.md`](./HANDOFF.md) and the extracted specifications in [`specs/`](./specs/).
+> **Sole Source of Truth:** [`AGENTS.md`](./AGENTS.md) and the specifications in [`specs/`](./specs/).
 > In case of any conflict between code and `specs/`, the specification wins and MUST be updated first (Spec-First).
 
 ## 1. Git Workflow (Strict No-PR Policy)
@@ -10,7 +10,7 @@
 - Before integrating a feature branch into `main`:
   1. Verify all directory ownership boundaries below.
   2. Run full build, unit tests, coverage gates, and non-negotiable audits locally / on Linux CI.
-  3. Cross-review by another agent family against `HANDOFF.md` and `specs/`.
+  3. Cross-review by another agent family against `AGENTS.md` and `specs/`.
   4. Merge locally using `git merge --no-ff <branch>` into `main`, push `origin main`, and delete both the local (`git branch -d`) and remote feature branches.
 - Always use LF (`\n`) line endings (`core.autocrlf = false`, `core.eol = lf`). Target runtime is exclusively **Headless Linux** (Debian 13 / Ubuntu 24.04 LTS, x86_64).
 

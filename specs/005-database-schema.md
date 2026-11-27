@@ -1,6 +1,6 @@
 # Spec 005 — PostgreSQL 17 Schema (EF Core 10 + Npgsql)
 
-> Append-only audit trail in PostgreSQL 17. Matches [`HANDOFF.md`](../HANDOFF.md) Section 9.
+> Append-only audit trail in PostgreSQL 17 (see also [`001-masterplan.md`](./001-masterplan.md)).
 
 ## 1. DDL Specification
 
