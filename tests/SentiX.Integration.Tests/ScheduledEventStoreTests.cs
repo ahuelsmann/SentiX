@@ -49,6 +49,41 @@ public sealed class ScheduledEventStoreTests
             Assert.Single(saved, row => row.Ticker is null && row.EventType == "CPI");
             Assert.Single(saved, row => row.Ticker == "AAPL" && row.EventType == "EARNINGS");
             Assert.All(saved, row => Assert.Equal(timestamp, row.ScheduledAtUtc));
+
+            var nextSession = timestamp.AddDays(1).AddHours(6);
+            var rescheduled = snapshot[1] with { ScheduledAtUtc = nextSession };
+            var outside = snapshot[1] with { ScheduledAtUtc = timestamp.AddDays(-1) };
+            var otherSource = snapshot[1] with { Source = "OTHER" };
+            var missing = snapshot[1] with { Ticker = "MSFT", Title = "MSFT Earnings" };
+            await store.AddNewAsync([outside, otherSource, missing], CancellationToken.None);
+
+            await store.ReplaceFinnhubWindowAsync(timestamp, timestamp.AddDays(14), [rescheduled],
+                includesEconomicCalendar: false, CancellationToken.None);
+            var refreshed = await db.ScheduledEvents.AsNoTracking().ToArrayAsync();
+            Assert.DoesNotContain(refreshed, row => row.Ticker == "MSFT");
+            Assert.Contains(refreshed, row => row.Ticker is null && row.EventType == "CPI");
+            Assert.Contains(refreshed, row => row.Source == "OTHER");
+            Assert.Contains(refreshed, row => row.ScheduledAtUtc == outside.ScheduledAtUtc);
+            var moved = Assert.Single(refreshed, row => row.Source == "FINNHUB" && row.Ticker == "AAPL" &&
+                row.ScheduledAtUtc >= timestamp);
+            Assert.Equal(nextSession, moved.ScheduledAtUtc);
+            Assert.NotEqual(default, moved.SyncedAtUtc);
+
+            var priorSync = moved.SyncedAtUtc.AddDays(-1);
+            await db.ScheduledEvents.Where(row => row.Id == moved.Id)
+                .ExecuteUpdateAsync(setters => setters.SetProperty(row => row.SyncedAtUtc, priorSync));
+            await store.ReplaceFinnhubWindowAsync(timestamp, timestamp.AddDays(14), [rescheduled, rescheduled],
+                includesEconomicCalendar: false, CancellationToken.None);
+            var repeated = Assert.Single(await db.ScheduledEvents.AsNoTracking().ToArrayAsync(),
+                row => row.Source == "FINNHUB" && row.Ticker == "AAPL" && row.ScheduledAtUtc >= timestamp);
+            Assert.Equal(moved.Id, repeated.Id);
+            Assert.True(repeated.SyncedAtUtc > priorSync);
+
+            await store.ReplaceFinnhubWindowAsync(timestamp, timestamp.AddDays(14), [],
+                includesEconomicCalendar: true, CancellationToken.None);
+            var afterEmpty = await db.ScheduledEvents.AsNoTracking().ToArrayAsync();
+            Assert.Equal(2, afterEmpty.Length);
+            Assert.DoesNotContain(afterEmpty, row => row.Source == "FINNHUB" && row.ScheduledAtUtc >= timestamp);
         }
         finally
         {
