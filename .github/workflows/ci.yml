@@ -23,24 +23,19 @@ jobs:
 
       - name: Configure, build & test src/native
         run: |
-          if [ -f src/native/CMakeLists.txt ]; then
-            cmake -S src/native -B build/native -DCMAKE_BUILD_TYPE=Release
-            cmake --build build/native -j
-            ctest --test-dir build/native --output-on-failure
-          else
-            echo "Skipping native job until T-03 CMakeLists.txt lands on this branch."
-          fi
+          cmake -S src/native -B build/native -DCMAKE_BUILD_TYPE=Release -DSENTIX_WERROR=ON
+          cmake --build build/native -j
+          ctest --test-dir build/native --output-on-failure
 
       - name: Upload sentix-native artifact
-        if: ${{ hashFiles('build/native/sentix-native') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: sentix-native-linux
           path: build/native/sentix-native
-          if-no-files-found: ignore
+          if-no-files-found: error
 
   dotnet:
-    name: .NET 10 Build, Unit & IPC Tests
+    name: .NET 10 Build, Unit, IPC & Docker Verification
     runs-on: ubuntu-24.04
     needs: [native]
     steps:
@@ -52,43 +47,38 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
-      - name: Download sentix-native artifact if present
+      - name: Download sentix-native artifact
         uses: actions/download-artifact@v4
         with:
           name: sentix-native-linux
           path: build/native
-        continue-on-error: true
 
-      - name: Build & test SentiX .NET projects
+      - name: Build & test SentiX.slnx (incl. live sentix-native IPC E2E)
         env:
           SENTIX_NATIVE_BIN: ${{ github.workspace }}/build/native/sentix-native
         run: |
-          if [ -f build/native/sentix-native ]; then
-            chmod +x build/native/sentix-native
-          fi
-          if [ -f SentiX.slnx ]; then
-            dotnet build SentiX.slnx -c Release
-            dotnet test SentiX.slnx -c Release --no-build
-          elif [ -f src/dotnet/SentiX.Risk/SentiX.Risk.csproj ] && [ -f tests/SentiX.Risk.Tests/SentiX.Risk.Tests.csproj ]; then
-            dotnet build tests/SentiX.Risk.Tests/SentiX.Risk.Tests.csproj -c Release
-            dotnet test tests/SentiX.Risk.Tests/SentiX.Risk.Tests.csproj -c Release --no-build
-          else
-            echo "Skipping dotnet job during bootstrap before .NET projects land."
-          fi
+          chmod +x build/native/sentix-native
+          dotnet build SentiX.slnx -c Release
+          dotnet test SentiX.slnx -c Release --no-build --logger "console;verbosity=normal"
 
-      - name: Enforce 100% branch coverage on SentiX.Risk
-        if: ${{ hashFiles('tests/SentiX.Risk.Tests/SentiX.Risk.Tests.csproj') != '' }}
+      - name: Enforce 100% branch & line coverage on SentiX.Risk
         run: |
-          dotnet test tests/SentiX.Risk.Tests/SentiX.Risk.Tests.csproj -c Release --collect:"XPlat Code Coverage" --results-directory TestResults/RiskCoverage
+          dotnet test tests/SentiX.Risk.Tests/SentiX.Risk.Tests.csproj -c Release --no-build --collect:"XPlat Code Coverage" --results-directory TestResults/RiskCoverage
           python3 -c '
           import glob, sys, xml.etree.ElementTree as ET
           files = glob.glob("TestResults/RiskCoverage/**/coverage.cobertura.xml", recursive=True)
           assert files, "No cobertura XML found"
-          rates = [float(ET.parse(f).getroot().attrib["branch-rate"]) for f in files]
-          min_rate = min(rates)
-          print(f"SentiX.Risk min branch-rate: {min_rate:.4f}")
-          sys.exit(0 if min_rate >= 1.0 else 1)
+          roots = [ET.parse(f).getroot() for f in files]
+          min_branch = min(float(r.attrib["branch-rate"]) for r in roots)
+          min_line = min(float(r.attrib["line-rate"]) for r in roots)
+          print(f"SentiX.Risk min branch-rate: {min_branch:.4f}, line-rate: {min_line:.4f}")
+          sys.exit(0 if min_branch >= 1.0 and min_line >= 1.0 else 1)
           '
+
+      - name: Verify production Linux Docker images
+        run: |
+          docker build -f deploy/Dockerfile.native -t sentix-native:ci .
+          docker build -f deploy/Dockerfile.host -t sentix-host:ci .
 
   web:
     name: React Web Dashboard
@@ -104,9 +94,5 @@ jobs:
 
       - name: Install & build src/web
         run: |
-          if [ -f src/web/package.json ]; then
-            npm --prefix src/web ci
-            npm --prefix src/web run build
-          else
-            echo "Skipping web job until T-05 src/web/package.json lands on this branch."
-          fi
+          npm --prefix src/web ci
+          npm --prefix src/web run build

@@ -5,8 +5,10 @@
         <Project Path="src/dotnet/SentiX.NativeBridge/SentiX.NativeBridge.csproj" />
         <Project Path="src/dotnet/SentiX.Ingestion/SentiX.Ingestion.csproj" />
         <Project Path="src/dotnet/SentiX.Host/SentiX.Host.csproj" />
+        <Project Path="src/dotnet/SentiX.Risk/SentiX.Risk.csproj" />
     </Folder>
     <Folder Name="/tests/">
         <Project Path="tests/SentiX.Integration.Tests/SentiX.Integration.Tests.csproj" />
+        <Project Path="tests/SentiX.Risk.Tests/SentiX.Risk.Tests.csproj" />
     </Folder>
 </Solution>

@@ -171,3 +171,11 @@ public sealed record RiskDecision(
   - `HaltedDailyLoss` -> resets to `Active` ONLY on a later US trading day at `>= 09:30 ET` (not a weekend/holiday) or explicit manual reset (`IsManualReset = true`).
   - `HaltedManual` -> resets to `Active` ONLY via explicit manual reset (`IsManualReset = true`).
   - `HaltedSystemError` -> resets to `Active` after `>= 30 s` continuous healthy native state (`HealthyDuration >= TimeSpan.FromSeconds(30)`) or explicit manual reset.
+
+## 5. Clarified Fail-Closed Evaluation Details & State Machine API
+
+- **Daily Loss State Transition:** Whenever `snapshot.DailyPnLPct <= policy.MaxDailyLossPct` (`-0.02`), `EffectiveTradingState` transitions to `TradingState.HaltedDailyLoss` deterministically regardless of `proposal.Action`.
+- **Closing `SELL` Semantics (Phase 1 Conservative Default):** Closing `SELL` proposals are exempt from Rules `1, 8, 9, 10, 11, 12` (`KillSwitchActive`, `DuplicatePosition`, `MaxOpenPositions`, `DailyLossLimitReached`, `SectorExposureExceeded`, `InsufficientBuyingPower`), while Rules `4, 5, 6, 7, 13` remain active in Phase 1. *(Note for Phase 4 Live Execution: relaxing hours/cooldown/confidence on emergency risk-reducing Long exits may be introduced explicitly via a dedicated policy flag after maintainer sign-off.)*
+- **Short-Opening `SELL` (`AllowShorting == true`):** Sized via `TargetNotional` and checked against Rule `12` (`InsufficientBuyingPower`), while Rules `8–11` remain scoped to `TradeAction.Buy`.
+- **Brackets & Ticker Ceiling:** Input `SuggestedStopLossPct <= 0` or `SuggestedTakeProfitPct <= 0` raises `InvalidBracketBounds` without substituting `DefaultStopLossPct`/`DefaultTakeProfitPct`. Tickers longer than `22` characters reject as `TickerNotAllowed` to guarantee the `<= 48`-character `ClientOrderId` invariant.
+- **`TradingStateMachine` Surface:** Exposes `TradingStateTransitionContext`, `Next(...)`, `ApplyDailyLossGuard(...)`, and `Halt(...)` as pure deterministic transitions with injected `MarketClock`.

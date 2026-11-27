@@ -145,3 +145,15 @@ Inside `sentix-native`, `SCORE_EVENT` executes deterministically in this order:
    - **Check 3 — Watchlist & Sector ETF Matching (`NO_WATCHLIST_MATCH`):** Match `sourceTickers` (case-insensitive) and whole-word/boundary occurrences of watchlist tickers, aliases, and sector ETF tickers in `effectiveText`. Collect unique sorted/ordered `matchedTickers` and unique associated `matchedSectorEtfs`. If both are empty -> `dropReason = "NO_WATCHLIST_MATCH"`, `passToDecisionSwarm = false`.
    - **Check 4 — Sentiment Engine (`ISentimentEngine` / `LOW_SENTIMENT_STRENGTH`):** Run Phase 1 deterministic mock scorer (swappable for ONNX-FinBERT `INT8` in Phase 2). If `abs(compositeScore) < fastPath.minAbsCompositeScore` (default `0.55`) -> `dropReason = "LOW_SENTIMENT_STRENGTH"`, `passToDecisionSwarm = false`.
    - **Pass:** Otherwise `dropReason = null`, `passToDecisionSwarm = true`.
+
+## 6. Clarified Edge Cases & Concurrency Guarantees (Spec-First Sync)
+
+- **Connection & Frame Limits:** `sentix-native` accepts up to `16` concurrent active connections (`INTERNAL_ERROR` returned when exhausted) and applies a `5 s` mid-frame read timeout per partial frame. Framing or JSON-parse failures carry `correlationId: ""`; unknown `type` values return `ERROR` (`DESERIALIZATION_ERROR`).
+- **Config Reload & Limits:** `RELOAD_CONFIG` validates `maxEquitiesWsSymbols <= 30` and total unique symbols as well; a failed reload returns `ERROR` (`INTERNAL_ERROR`, `retryable: true`) and retains the prior active config if one was loaded (entering `DEGRADED` only when no valid config is active).
+- **Extended HTML Cleaning:** In addition to `<...>` stripping and `&amp;`, `&lt;`, `&gt;`, `&quot;`, `&#39;`, `&nbsp;`, the cleaner strips `<script>`/`<style>` element contents, decodes `&apos;` and numeric character references (`&#...;` / `&#x...;`), and preserves `<` when not followed by an ASCII tag starter letter.
+- **Deduplication Time Base & Empty Text:** Rolling `dedupWindowMinutes` is measured via daemon monotonic `steady_clock` receive time. Empty `effectiveText` events normalize to a single SHA-256 digest and therefore deduplicate consistently.
+- **Matching & Drop Semantics:**
+  - `socialAllowlist` `source` values are matched case-sensitively (`ALPACA_BENZINGA`, `SEC_EDGAR`, `X_ALLOWLIST`); for non-`X_ALLOWLIST` sources, `author` is not required to match `identifier`.
+  - Text ticker matching requires uppercase tickers as written or `$TICKER` cashtags (case-insensitive), while watchlist `aliases` match case-insensitively.
+  - Direct sector ETF ticker matches populate `matchedSectorEtfs` only; `benchmarkTicker` (`SPY`) never triggers `matchedTickers` or `matchedSectorEtfs`.
+  - Pre-scoring drops (`SOURCE_NOT_ALLOWED`, `DUPLICATE`, `NO_WATCHLIST_MATCH`) emit `finbert: { positive: 0, negative: 0, neutral: 1, compositeScore: 0 }` and empty match lists (unless already populated prior to drop).

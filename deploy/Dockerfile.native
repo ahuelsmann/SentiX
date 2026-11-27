@@ -4,7 +4,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /source
 COPY src/native/ src/native/
-RUN cmake -S src/native -B build/native -G Ninja -DCMAKE_BUILD_TYPE=Release \
+RUN cmake -S src/native -B build/native -G Ninja -DCMAKE_BUILD_TYPE=Release -DSENTIX_BUILD_TESTS=OFF \
     && cmake --build build/native --target sentix-native
 
 FROM ubuntu:24.04 AS runtime
