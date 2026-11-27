@@ -34,9 +34,9 @@
 6. **Slow-Path & UI (`SentiX.Infrastructure` + `src/web`):** PostgreSQL 17 audit trail, daily SPY benchmark, SignalR dashboard & Kill-Switch.
 
 ### Delivery Phases
-- **Phase 1 (Current):** Monorepo, Linux CI, PostgreSQL 17 schema, C++20/23 IPC daemon (HTML stripping + `summary` fallback + deterministic mock scorer), Hard-Risk-Manager (`0 % AI`, `100 %` branch coverage, Long-Only), `SentiX.NativeBridge`, Alpaca News Collector (`v1beta1/news`, `0` trades), optional X adapter skeleton (graceful skip when `X_BEARER_TOKEN` is empty), minimal React web shell, Dockerfiles, IPC integration test.
-- **Phase 2:** Real ONNX-FinBERT (`INT8`) in C++20/23, SEC EDGAR 8-K + X API v2 Filtered Stream (`SentiX2026`), optional Earnings/Macro calendar sync (`scheduled_events`).
-- **Phase 3:** Decision-Swarm orchestration + debate persistence + React shadow dashboard.
+- **Phase 1 (Completed):** Monorepo, Linux CI, PostgreSQL 17 schema, C++20/23 IPC daemon (HTML stripping + `summary` fallback + deterministic mock scorer), Hard-Risk-Manager (`0 % AI`, `100 %` branch coverage, Long-Only), `SentiX.NativeBridge`, Alpaca News Collector (`v1beta1/news`, `0` trades), optional X adapter skeleton (graceful skip when `X_BEARER_TOKEN` is empty), minimal React web shell, Dockerfiles, IPC integration test.
+- **Phase 2 (Completed):** Real ONNX-FinBERT (`INT8`) in C++20/23 via runtime `dlopen`, SEC EDGAR 8-K + X API v2 Filtered Stream (`SentiX2026`), Finnhub 14-day calendar sync (`scheduled_events`), Alpaca `v2/iex` Quotes collector & `IMarketQuoteCache`.
+- **Phase 3 (Active — `specs/007`):** Decision-Swarm 5-agent orchestration (`SentiX.DecisionSwarm`) + shadow `HardRiskManager` evaluation + PostgreSQL debate persistence + React shadow dashboard (`tradingEnabled = false`).
 - **Phase 4:** Alpaca Paper bracket execution + UI Kill-Switch + 4–8 week live paper benchmark vs `SPY`.
 
 ## 4. External API Limits & Configuration Contracts
