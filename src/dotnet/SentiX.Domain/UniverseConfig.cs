@@ -22,5 +22,5 @@ public sealed record UniverseConfig(
 }
 
 public sealed record FastPathConfig(double MinAbsCompositeScore, int DedupWindowMinutes);
-public sealed record WatchlistEntry(string Ticker, string Sector, IReadOnlyList<string> Aliases);
+public sealed record WatchlistEntry(string Ticker, string Sector, IReadOnlyList<string> Aliases, string? Cik = null);
 public sealed record SocialAllowlistEntry(EventSource Source, string Identifier, TrustTier TrustTier);
