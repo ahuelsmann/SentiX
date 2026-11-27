@@ -19,14 +19,25 @@ internal static class LlmHttp
     public static HttpContent JsonBody(object payload) =>
         new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, JsonMediaType);
 
+    /// <summary>
+    /// Sends the request and reads the (capped) body. Network / stream failures during the send, the header phase
+    /// AND the body read (e.g. a connection reset mid-body) are classified identically as transient
+    /// <see cref="LlmException"/>s so the orchestrator retries them once. Caller cancellation propagates unchanged.
+    /// </summary>
     public static async Task<string> SendAsync(HttpClient http, HttpRequestMessage message, string provider,
         CancellationToken cancellationToken)
     {
-        HttpResponseMessage response;
         try
         {
-            response = await http.SendAsync(message, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
+            using var response = await http.SendAsync(message, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
                 .ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                var status = (int)response.StatusCode;
+                throw new LlmException($"{provider}: HTTP {status}.", IsTransientStatus(response.StatusCode));
+            }
+
+            return await ReadCappedAsync(response.Content, provider, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -40,16 +51,28 @@ internal static class LlmHttp
         {
             throw new LlmException($"{provider}: network error.", isTransient: true, ex);
         }
-
-        using (response)
+        catch (IOException ex)
         {
-            if (!response.IsSuccessStatusCode)
+            throw new LlmException($"{provider}: network stream error.", isTransient: true, ex);
+        }
+    }
+
+    /// <summary>Parses a caller-supplied JSON Schema into an element that serializes verbatim into the payload.</summary>
+    public static JsonElement ParseSchema(string schema, string provider)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(schema);
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
             {
-                var status = (int)response.StatusCode;
-                throw new LlmException($"{provider}: HTTP {status}.", IsTransientStatus(response.StatusCode));
+                throw new LlmException($"{provider}: JSON schema must be an object.", isTransient: false);
             }
 
-            return await ReadCappedAsync(response.Content, provider, cancellationToken).ConfigureAwait(false);
+            return document.RootElement.Clone();
+        }
+        catch (JsonException ex)
+        {
+            throw new LlmException($"{provider}: JSON schema is not valid JSON.", isTransient: false, ex);
         }
     }
 
@@ -109,8 +132,10 @@ internal static class LlmHttp
             : 0;
 
     /// <summary>
-    /// Extracts exactly one JSON object from model text, unwrapping markdown code fences
-    /// (<c>```json ... ```</c>) and surrounding prose. Throws <see cref="LlmResponseFormatException"/> otherwise.
+    /// Validates that the model text is exactly one top-level JSON object. The ONLY tolerated wrapping is a single
+    /// clean markdown fence (<c>```json\n{...}\n```</c> or <c>```\n{...}\n```</c>) around the whole trimmed payload.
+    /// Any prose before/after the object or the fence, unterminated fences, non-object roots and trailing content are
+    /// rejected with <see cref="LlmResponseFormatException"/>.
     /// </summary>
     public static string ExtractJsonObject(string? text)
     {
@@ -128,29 +153,25 @@ internal static class LlmHttp
         if (candidate.StartsWith("```", StringComparison.Ordinal))
         {
             var firstNewLine = candidate.IndexOf('\n');
-            if (firstNewLine < 0)
+            if (firstNewLine < 0 || candidate.Length < firstNewLine + 4 ||
+                !candidate.EndsWith("```", StringComparison.Ordinal))
             {
                 throw new LlmResponseFormatException("Model returned an unterminated code fence.");
             }
 
-            candidate = candidate[(firstNewLine + 1)..];
-            var closing = candidate.LastIndexOf("```", StringComparison.Ordinal);
-            if (closing >= 0)
+            var language = candidate[3..firstNewLine].Trim();
+            if (language.Length != 0 && !string.Equals(language, "json", StringComparison.OrdinalIgnoreCase))
             {
-                candidate = candidate[..closing];
+                throw new LlmResponseFormatException("Model returned a non-JSON code fence.");
             }
 
-            candidate = candidate.Trim();
+            candidate = candidate[(firstNewLine + 1)..^3].Trim();
         }
 
-        var start = candidate.IndexOf('{');
-        var end = candidate.LastIndexOf('}');
-        if (start < 0 || end <= start)
+        if (!candidate.StartsWith('{') || !candidate.EndsWith('}'))
         {
-            throw new LlmResponseFormatException("Model content does not contain a JSON object.");
+            throw new LlmResponseFormatException("Model content is not a pure JSON object (prose wrapping rejected).");
         }
-
-        candidate = candidate[start..(end + 1)];
 
         try
         {

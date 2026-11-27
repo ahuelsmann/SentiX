@@ -9,15 +9,31 @@ public interface ILlmClient
     Task<LlmCompletionResult> CompleteJsonAsync(LlmCompletionRequest request, CancellationToken cancellationToken);
 }
 
+/// <summary>
+/// One structured completion call. When <see cref="JsonSchema"/> is supplied (Spec 003 §2 role schema, see
+/// <see cref="AgentJsonSchemas"/>), providers enforce it natively: OpenAI-compatible via
+/// <c>response_format.type = json_schema</c> (<c>strict: true</c>), Anthropic via a forced tool call whose
+/// <c>input_schema</c> is the role schema. <see cref="SchemaName"/> defaults to <see cref="AgentJsonSchemas.NameFor"/>.
+/// </summary>
 public sealed record LlmCompletionRequest(
     LlmTier Tier,
     AgentRole Role,
     string SystemPrompt,
     string UserPrompt,
     double Temperature,
-    int MaxOutputTokens = 1024);
+    int MaxOutputTokens = 1024,
+    string? JsonSchema = null,
+    string? SchemaName = null)
+{
+    /// <summary>Provider-safe schema / tool name used when <see cref="JsonSchema"/> is set.</summary>
+    public string EffectiveSchemaName =>
+        string.IsNullOrWhiteSpace(SchemaName) ? AgentJsonSchemas.NameFor(Role) : SchemaName.Trim();
+}
 
-/// <summary>Completion result. <see cref="Json"/> is a single, already unwrapped and syntax-validated JSON object.</summary>
+/// <summary>
+/// Completion result. <see cref="Json"/> is a single, already unwrapped and syntax-validated top-level JSON object
+/// (prose-wrapped payloads are rejected).
+/// </summary>
 public sealed record LlmCompletionResult(string Json, int PromptTokens, int CompletionTokens, int TotalTokens, string Model);
 
 /// <summary>LLM transport/provider failure. Messages never contain API keys or response bodies.</summary>

@@ -4,7 +4,9 @@ using System.Text.Json;
 namespace SentiX.DecisionSwarm;
 
 /// <summary>
-/// <c>openai_compatible</c> provider: <c>POST {baseUrl}/chat/completions</c> with <c>response_format = json_object</c>.
+/// <c>openai_compatible</c> provider: <c>POST {baseUrl}/chat/completions</c> with strict
+/// <c>response_format = json_schema</c> when <see cref="LlmCompletionRequest.JsonSchema"/> is set (else <c>json_object</c>).
+/// The returned content must be a pure top-level JSON object (prose wrapping is rejected).
 /// Pure <see cref="HttpClient"/>; the API key is only ever placed into the <c>Authorization</c> header.
 /// </summary>
 public sealed class OpenAiCompatibleLlmClient : ILlmClient
@@ -32,7 +34,7 @@ public sealed class OpenAiCompatibleLlmClient : ILlmClient
             ["model"] = tier.Model,
             ["temperature"] = request.Temperature,
             ["max_tokens"] = request.MaxOutputTokens,
-            ["response_format"] = new Dictionary<string, string> { ["type"] = "json_object" },
+            ["response_format"] = BuildResponseFormat(request),
             ["messages"] = new object[]
             {
                 new Dictionary<string, string> { ["role"] = "system", ["content"] = request.SystemPrompt },
@@ -74,5 +76,28 @@ public sealed class OpenAiCompatibleLlmClient : ILlmClient
             ? m.GetString() ?? tier.Model
             : tier.Model;
         return new LlmCompletionResult(json, promptTokens, completionTokens, totalTokens, model);
+    }
+
+    /// <summary>
+    /// Strict structured outputs (<c>json_schema</c>, <c>strict: true</c>) when a role schema is supplied — the wire
+    /// format shared by OpenAI and Azure OpenAI; plain <c>json_object</c> mode otherwise.
+    /// </summary>
+    private static object BuildResponseFormat(LlmCompletionRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.JsonSchema))
+        {
+            return new Dictionary<string, string> { ["type"] = "json_object" };
+        }
+
+        return new Dictionary<string, object>
+        {
+            ["type"] = "json_schema",
+            ["json_schema"] = new Dictionary<string, object>
+            {
+                ["name"] = request.EffectiveSchemaName,
+                ["strict"] = true,
+                ["schema"] = LlmHttp.ParseSchema(request.JsonSchema, ProviderName)
+            }
+        };
     }
 }

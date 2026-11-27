@@ -90,6 +90,8 @@ public sealed class DecisionSwarmOrchestratorTests
             var request = client.Request(role);
             Assert.Equal(temperature, request.Temperature, 6);
             Assert.Equal(tier, request.Tier);
+            Assert.Equal(AgentJsonSchemas.For(role), request.JsonSchema);
+            Assert.Equal(AgentJsonSchemas.NameFor(role), request.EffectiveSchemaName);
             Assert.Contains(PromptBuilder.InjectionGuard, request.SystemPrompt, StringComparison.Ordinal);
         }
 
@@ -414,6 +416,146 @@ public sealed class DecisionSwarmOrchestratorTests
         Assert.NotNull(outcome.BearJson);
         Assert.NotNull(outcome.SoftRiskJson);
         Assert.Equal(400, outcome.TotalTokens);
+        Assert.InRange(time.Elapsed, TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(21));
+    }
+
+    [Fact]
+    public async Task Stage1_NonCooperativeClient_IgnoresCancellation_AbortsAtTimeoutAndFailsClosed()
+    {
+        var (sut, client, time) = Create();
+        var neverCompletes = new TaskCompletionSource<LlmCompletionResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.Handlers[AgentRole.FactAnalyst] = (_, _) => neverCompletes.Task;
+
+        var outcome = await time.DriveAsync(sut.EvaluateAsync(Fixtures.Request(), CancellationToken.None), client,
+            TimeSpan.FromMilliseconds(500));
+
+        AssertFailClosed(outcome, "FactAnalyst: timeout after 1 retry");
+        Assert.Equal(2, client.Calls(AgentRole.FactAnalyst));
+        Assert.InRange(time.Elapsed, TimeSpan.FromSeconds(16), TimeSpan.FromSeconds(19));
+    }
+
+    [Fact]
+    public async Task Stage1_NonCooperativeClient_LateFaultAfterAbandonment_IsObserved()
+    {
+        var (sut, client, time) = Create();
+        var abandonedTcs = new TaskCompletionSource<LlmCompletionResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.Handlers[AgentRole.FactAnalyst] = (attempt, _) => attempt == 1
+            ? abandonedTcs.Task
+            : Task.FromResult(ScriptedLlmClient.Result(Fixtures.FactJson));
+
+        var observedUnobserved = new List<Exception>();
+        EventHandler<UnobservedTaskExceptionEventArgs> onUnobserved = (_, args) =>
+        {
+            if (args.Exception.InnerExceptions.Any(ex => ex.Message == "late-abandon-sentinel"))
+            {
+                observedUnobserved.Add(args.Exception);
+            }
+        };
+
+        TaskScheduler.UnobservedTaskException += onUnobserved;
+        try
+        {
+            var outcome = await time.DriveAsync(sut.EvaluateAsync(Fixtures.Request(), CancellationToken.None), client,
+                TimeSpan.FromMilliseconds(500));
+
+            Assert.False(outcome.FallbackUsed);
+            Assert.Equal(2, client.Calls(AgentRole.FactAnalyst));
+
+            // Now fault the abandoned task after the orchestrator moved on; ObserveAbandoned must observe it.
+            abandonedTcs.SetException(new InvalidOperationException("late-abandon-sentinel"));
+            await Task.Yield();
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+
+            Assert.Empty(observedUnobserved);
+        }
+        finally
+        {
+            TaskScheduler.UnobservedTaskException -= onUnobserved;
+        }
+    }
+
+    [Fact]
+    public async Task Stage1_NonCooperativeClient_CompletesLateAfterBudgetDeadline_IsRejected()
+    {
+        var (sut, client, time) = Create();
+        var gate = new TaskCompletionSource<LlmCompletionResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.Handlers[AgentRole.FactAnalyst] = (_, _) => gate.Task;
+
+        var evaluation = sut.EvaluateAsync(Fixtures.Request(), CancellationToken.None);
+        var sw = Stopwatch.StartNew();
+        while (client.InFlight == 0 && sw.Elapsed < TestTimeout)
+        {
+            await Task.Delay(1);
+        }
+
+        // Advance past the 20s debate deadline, then resolve the non-cooperative task late.
+        time.Advance(TimeSpan.FromSeconds(21));
+        gate.TrySetResult(ScriptedLlmClient.Result(Fixtures.FactJson));
+
+        var outcome = await evaluation.WaitAsync(TestTimeout);
+
+        AssertFailClosed(outcome, "FactAnalyst: debate_budget_exhausted");
+        Assert.Equal(1, client.Calls(AgentRole.FactAnalyst));
+    }
+
+    [Fact]
+    public async Task Stage2_ParallelNonCooperativeClient_OneAgentHangs_AbortsWhenAllAndFailsClosed()
+    {
+        var (sut, client, time) = Create();
+        var neverCompletes = new TaskCompletionSource<LlmCompletionResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.Handlers[AgentRole.BullAgent] = (_, _) => neverCompletes.Task;
+
+        var outcome = await time.DriveAsync(sut.EvaluateAsync(Fixtures.Request(), CancellationToken.None), client,
+            TimeSpan.FromMilliseconds(500));
+
+        AssertFailClosed(outcome, "BullAgent: timeout after 1 retry");
+        Assert.Equal(2, client.Calls(AgentRole.BullAgent));
+        Assert.Equal(1, client.Calls(AgentRole.BearAgent));
+        Assert.Equal(1, client.Calls(AgentRole.SoftRiskAgent));
+        Assert.Equal(0, client.Calls(AgentRole.JudgeAgent));
+        Assert.InRange(time.Elapsed, TimeSpan.FromSeconds(16), TimeSpan.FromSeconds(19));
+    }
+
+    [Fact]
+    public async Task Stage2_ParallelNonCooperativeClient_SiblingFailureAbortsHungPeersImmediately()
+    {
+        var (sut, client, _) = Create();
+        var neverCompletes = new TaskCompletionSource<LlmCompletionResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.Handlers[AgentRole.BullAgent] = (_, _) => neverCompletes.Task;
+        client.Handlers[AgentRole.SoftRiskAgent] = (_, _) => neverCompletes.Task;
+        client.Handlers[AgentRole.BearAgent] = (_, _) => throw new LlmException("openai_compatible: HTTP 400.", false);
+
+        var outcome = await sut.EvaluateAsync(Fixtures.Request(), CancellationToken.None).WaitAsync(TestTimeout);
+
+        AssertFailClosed(outcome, "BearAgent: llm_error");
+        Assert.Null(outcome.BullJson);
+        Assert.Null(outcome.SoftRiskJson);
+        Assert.Equal(0, client.Calls(AgentRole.JudgeAgent));
+    }
+
+    [Fact]
+    public async Task Stage2_ParallelNonCooperativeClient_LateCompletionAfter20sBudget_IsRejected()
+    {
+        var (sut, client, time) = Create();
+        client.Handlers[AgentRole.FactAnalyst] = async (_, ct) =>
+        {
+            await Task.Delay(TimeSpan.FromSeconds(7), time, ct);
+            return ScriptedLlmClient.Result(Fixtures.FactJson);
+        };
+        client.Handlers[AgentRole.SoftRiskAgent] = async (_, _) =>
+        {
+            // Ignores CancellationToken and finishes at t = 7s + 14s = 21s (after the 20s debate budget).
+            await Task.Delay(TimeSpan.FromSeconds(14), time, CancellationToken.None);
+            return ScriptedLlmClient.Result(Fixtures.SoftRiskJson);
+        };
+
+        var outcome = await time.DriveAsync(sut.EvaluateAsync(Fixtures.Request(), CancellationToken.None), client,
+            TimeSpan.FromMilliseconds(250));
+
+        AssertFailClosed(outcome, "SoftRiskAgent: debate_budget_exhausted");
+        Assert.Equal(0, client.Calls(AgentRole.JudgeAgent));
         Assert.InRange(time.Elapsed, TimeSpan.FromSeconds(20), TimeSpan.FromSeconds(21));
     }
 

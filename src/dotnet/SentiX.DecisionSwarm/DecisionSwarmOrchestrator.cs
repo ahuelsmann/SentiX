@@ -86,7 +86,7 @@ public sealed class DecisionSwarmOrchestrator : IDecisionSwarmOrchestrator
         cancellationToken.ThrowIfCancellationRequested();
 
         var state = new DebateState(request, CreateProposalId(request.Event.EventId, _prompts.PromptVersion),
-            _time.GetTimestamp());
+            _time.GetTimestamp(), _time.GetUtcNow() + TotalDebateBudget);
 
         if (!_options.IsConfigured)
         {
@@ -204,34 +204,61 @@ public sealed class DecisionSwarmOrchestrator : IDecisionSwarmOrchestrator
         return Complete(state, proposal, judgeJson, fallbackUsed: false, failureReason: null);
     }
 
+    /// <summary>
+    /// Runs one agent with at most <see cref="MaxRetriesPerAgent"/> retry. <see cref="ILlmClient"/> is treated as
+    /// potentially NON-cooperative on cancellation: every attempt is raced (<see cref="Task.WhenAny(Task[])"/>) against a
+    /// <see cref="TimeProvider"/> delay bounded by BOTH the 8 s per-agent timeout and the remaining 20 s debate budget.
+    /// On timeout / budget exhaustion / sibling or caller cancellation the attempt token is cancelled and the call is
+    /// abandoned (its eventual fault is observed) — the orchestrator never awaits a client that ignores its token.
+    /// A response is accepted only if it arrived while the attempt was still live and within the debate deadline.
+    /// </summary>
     private async Task<(T Value, string Json)> RunAgentAsync<T>(AgentRole role, LlmTier tier, LlmPrompt prompt,
         double temperature, Action<T> validate, DebateState state, CallScope scope) where T : class
     {
-        var request = new LlmCompletionRequest(tier, role, prompt.SystemPrompt, prompt.UserPrompt, temperature);
+        var request = new LlmCompletionRequest(tier, role, prompt.SystemPrompt, prompt.UserPrompt, temperature,
+            JsonSchema: AgentJsonSchemas.For(role), SchemaName: AgentJsonSchemas.NameFor(role));
         var lastReason = "unknown";
 
         for (var attempt = 0; attempt <= MaxRetriesPerAgent; attempt++)
         {
-            if (scope.Caller.IsCancellationRequested)
-            {
-                scope.Caller.ThrowIfCancellationRequested();
-            }
+            ThrowIfInterrupted(role, state, scope);
 
-            if (scope.Budget.IsCancellationRequested)
+            var remaining = state.BudgetDeadline - _time.GetUtcNow();
+            if (remaining <= TimeSpan.Zero)
             {
                 throw state.Failed($"{role}: debate_budget_exhausted");
             }
 
-            if (scope.Effective.IsCancellationRequested)
+            var window = remaining < PerAgentTimeout ? remaining : PerAgentTimeout;
+            using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(scope.Effective);
+            var callTask = InvokeClientAsync(request, attemptCts.Token);
+            var timeoutTask = Task.Delay(window, _time, CancellationToken.None);
+            var cancelTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            await using var cancelReg = scope.Effective.Register(
+                static s => ((TaskCompletionSource)s!).TrySetResult(), cancelTcs);
+            var winner = await Task.WhenAny(callTask, timeoutTask, cancelTcs.Task).ConfigureAwait(false);
+
+            var accepted = ReferenceEquals(winner, callTask) &&
+                           !timeoutTask.IsCompleted &&
+                           !attemptCts.IsCancellationRequested &&
+                           _time.GetUtcNow() <= state.BudgetDeadline;
+
+            // Cancels the (possibly still running) call in every case.
+            await attemptCts.CancelAsync().ConfigureAwait(false);
+
+            if (!accepted)
             {
-                throw new AgentFailedException($"{role}: cancelled");
+                ObserveAbandoned(callTask);
+                ThrowIfInterrupted(role, state, scope);
+                lastReason = "timeout";
+                _logger.LogWarning("Decision-Swarm agent {Role} attempt {Attempt} failed: {Reason} (event {EventId}).",
+                    role, attempt + 1, lastReason, state.Request.Event.EventId);
+                continue;
             }
 
-            using var attemptTimeout = new CancellationTokenSource(PerAgentTimeout, _time);
-            using var linked = CancellationTokenSource.CreateLinkedTokenSource(scope.Effective, attemptTimeout.Token);
             try
             {
-                var result = await _client.CompleteJsonAsync(request, linked.Token).ConfigureAwait(false);
+                var result = await callTask.ConfigureAwait(false);
                 state.AddTokens(result?.TotalTokens ?? 0);
                 var json = LlmHttp.ExtractJsonObject(result?.Json);
                 var value = JsonSerializer.Deserialize<T>(json, SentiXJson.Options)
@@ -243,17 +270,17 @@ public sealed class DecisionSwarmOrchestrator : IDecisionSwarmOrchestrator
             {
                 throw;
             }
-            catch (OperationCanceledException) when (scope.Budget.IsCancellationRequested)
+            catch (OperationCanceledException) when (scope.Budget.IsCancellationRequested || _time.GetUtcNow() >= state.BudgetDeadline)
             {
                 throw state.Failed($"{role}: debate_budget_exhausted");
             }
-            catch (OperationCanceledException) when (attemptTimeout.IsCancellationRequested)
+            catch (OperationCanceledException) when (scope.Effective.IsCancellationRequested)
             {
-                lastReason = "timeout";
+                throw new AgentFailedException($"{role}: cancelled");
             }
             catch (OperationCanceledException)
             {
-                throw new AgentFailedException($"{role}: cancelled");
+                lastReason = "timeout";
             }
             catch (LlmResponseFormatException)
             {
@@ -281,6 +308,51 @@ public sealed class DecisionSwarmOrchestrator : IDecisionSwarmOrchestrator
         }
 
         throw state.Failed($"{role}: {lastReason} after {MaxRetriesPerAgent} retry");
+    }
+
+    private Task<LlmCompletionResult> InvokeClientAsync(LlmCompletionRequest request, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return _client.CompleteJsonAsync(request, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            return Task.FromException<LlmCompletionResult>(ex);
+        }
+    }
+
+    private void ThrowIfInterrupted(AgentRole role, DebateState state, CallScope scope)
+    {
+        if (scope.Caller.IsCancellationRequested)
+        {
+            scope.Caller.ThrowIfCancellationRequested();
+        }
+
+        if (scope.Budget.IsCancellationRequested || _time.GetUtcNow() >= state.BudgetDeadline)
+        {
+            throw state.Failed($"{role}: debate_budget_exhausted");
+        }
+
+        if (scope.Effective.IsCancellationRequested)
+        {
+            throw new AgentFailedException($"{role}: cancelled");
+        }
+    }
+
+    private static void ObserveAbandoned(Task callTask)
+    {
+        if (callTask.IsCompleted)
+        {
+            _ = callTask.Exception;
+            return;
+        }
+
+        _ = callTask.ContinueWith(
+            static t => _ = t.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 
     private static async Task<(T Value, string Json)> CancelSiblingsOnFailure<T>(Task<(T Value, string Json)> task,
@@ -394,7 +466,8 @@ public sealed class DecisionSwarmOrchestrator : IDecisionSwarmOrchestrator
         public string Reason { get; } = reason;
     }
 
-    private sealed class DebateState(DecisionDebateRequest request, string proposalId, long startTimestamp)
+    private sealed class DebateState(DecisionDebateRequest request, string proposalId, long startTimestamp,
+        DateTimeOffset budgetDeadline)
     {
         private int _totalTokens;
         private string? _firstFailure;
@@ -402,6 +475,7 @@ public sealed class DecisionSwarmOrchestrator : IDecisionSwarmOrchestrator
         public DecisionDebateRequest Request { get; } = request;
         public string ProposalId { get; } = proposalId;
         public long StartTimestamp { get; } = startTimestamp;
+        public DateTimeOffset BudgetDeadline { get; } = budgetDeadline;
         public string? FactJson { get; set; }
         public string? BullJson { get; set; }
         public string? BearJson { get; set; }
