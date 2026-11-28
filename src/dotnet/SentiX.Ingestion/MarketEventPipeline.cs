@@ -37,10 +37,12 @@ public sealed class MarketEventPipeline(
     IPaperExecutionEngine? paperExecution = null,
     AlpacaPaperOptions? paperOptions = null,
     IPaperPortfolioSnapshotProvider? paperPortfolioProvider = null,
-    IPaperOrderAuditStore? orderAuditStore = null) : IMarketEventPipeline, IDisposable
+    IPaperOrderAuditStore? orderAuditStore = null,
+    IAlpacaPaperBrokerClient? paperBrokerClient = null) : IMarketEventPipeline, IDisposable
 {
     private static readonly TimeSpan LocalOrderHistoryWindow = TimeSpan.FromHours(48);
     private readonly SemaphoreSlim migration = new(1, 1);
+    private readonly SemaphoreSlim armedExecutionGate = new(1, 1);
     private readonly TimeProvider clock = timeProvider ?? TimeProvider.System;
     private readonly IPaperOrderAuditStore auditStore = orderAuditStore ?? new EfCorePaperOrderAuditStore(dbFactory, logger);
     private volatile bool migrated;
@@ -184,36 +186,66 @@ public sealed class MarketEventPipeline(
             (int)Math.Clamp(outcome.TotalLatencyMs, 0, int.MaxValue),
             evaluatedAtUtc);
 
-        var persistedTradingState = await db.SystemState.AsNoTracking()
-            .Where(row => row.Id == 1)
-            .Select(row => row.TradingState)
-            .SingleOrDefaultAsync(token);
-        var tradingState = ParsePersistedTradingState(persistedTradingState);
-
-        var isArmedPaperMode = paperOptions is { TradingEnabled: true };
-        RiskProposal riskProposal;
-        decimal entryPrice;
-        RiskDecision? riskDecision;
-        int openLongQuantity = 0;
-
-        if (!isArmedPaperMode)
+        if (paperOptions is not { TradingEnabled: true })
         {
             // Shadow Mode strictly uses the synthetic $100k empty portfolio with zero broker HTTP calls.
-            (riskProposal, entryPrice, riskDecision) = EvaluateHardRiskWithInputs(
+            var persistedTradingState = await db.SystemState.AsNoTracking()
+                .Where(row => row.Id == 1)
+                .Select(row => row.TradingState)
+                .SingleOrDefaultAsync(token);
+            var tradingState = ParsePersistedTradingState(persistedTradingState);
+            var (_, _, shadowDecision) = EvaluateHardRiskWithInputs(
                 proposal, ticker, quoteCache, universe, tradingState, evaluatedAtUtc);
+
+            db.DecisionDebates.Add(debateRow);
+            db.RiskEvaluations.Add(BuildRiskEvaluationRow(proposal.ProposalId, shadowDecision, evaluatedAtUtc));
+            await db.SaveChangesAsync(token);
+            return;
         }
-        else
+
+        await ExecuteArmedEvaluationAndOrderAsync(
+            proposal,
+            ticker,
+            evaluatedAtUtc,
+            ct => db.SystemState.AsNoTracking()
+                .Where(row => row.Id == 1)
+                .Select(row => row.TradingState)
+                .SingleOrDefaultAsync(ct),
+            async (riskRow, ct) =>
+            {
+                db.DecisionDebates.Add(debateRow);
+                db.RiskEvaluations.Add(riskRow);
+                await db.SaveChangesAsync(ct);
+            },
+            token);
+    }
+
+    internal async Task ExecuteArmedEvaluationAndOrderAsync(
+        SentiX.Domain.TradeProposal proposal,
+        string? ticker,
+        DateTimeOffset evaluatedAtUtc,
+        Func<CancellationToken, Task<string?>> readPersistedTradingStateAsync,
+        Func<RiskEvaluationRow, CancellationToken, Task> persistDebateAndRiskAsync,
+        CancellationToken token)
+    {
+        PaperOrderExecutionRequest? reservedExecRequest = null;
+
+        // Serialize read snapshot -> evaluate HardRiskManager -> commit durable PENDING_SUBMIT reservation
+        // across all concurrent collectors so two simultaneous events can never approve against the same unreserved exposure.
+        await armedExecutionGate.WaitAsync(token);
+        try
         {
+            var rawTradingState = await readPersistedTradingStateAsync(token);
+            var tradingState = ParsePersistedTradingState(rawTradingState);
             var armedEval = await EvaluateArmedPaperRiskAsync(proposal, ticker, tradingState, evaluatedAtUtc, token);
+
             if (!armedEval.SnapshotAvailable)
             {
-                // Fail closed: NEVER fall back to synthetic $100k portfolio when TradingEnabled == true!
                 var unavailableViolationsJson = JsonSerializer.Serialize(
                     new[] { new { code = "PAPER_PORTFOLIO_UNAVAILABLE", message = armedEval.FailureReason ?? "Authoritative paper portfolio snapshot is unavailable." } },
                     SentiXJson.Options);
 
-                db.DecisionDebates.Add(debateRow);
-                db.RiskEvaluations.Add(new RiskEvaluationRow(
+                var failedClosedRiskRow = new RiskEvaluationRow(
                     0,
                     proposal.ProposalId,
                     Approved: false,
@@ -223,52 +255,57 @@ public sealed class MarketEventPipeline(
                     ClampedSlPct: null,
                     ClampedTpPct: null,
                     ClientOrderId: null,
-                    evaluatedAtUtc));
-                await db.SaveChangesAsync(token);
+                    evaluatedAtUtc);
+
+                await persistDebateAndRiskAsync(failedClosedRiskRow, token);
                 return;
             }
 
-            riskProposal = armedEval.Proposal!;
-            entryPrice = armedEval.EntryPrice;
-            riskDecision = armedEval.Decision!;
-            openLongQuantity = armedEval.OpenLongQuantity;
+            var riskDecision = armedEval.Decision!;
+            await persistDebateAndRiskAsync(BuildRiskEvaluationRow(proposal.ProposalId, riskDecision, evaluatedAtUtc), token);
+
+            if (paperExecution is not null &&
+                riskDecision.Approved &&
+                proposal.Action != DomainTradeAction.Hold &&
+                !string.IsNullOrWhiteSpace(riskDecision.ClientOrderId) &&
+                !string.IsNullOrWhiteSpace(ticker))
+            {
+                var baseRequest = PaperOrderExecutionRequest.FromRiskDecision(armedEval.Proposal!, riskDecision, armedEval.EntryPrice);
+                var candidateRequest = proposal.Action == DomainTradeAction.Sell && armedEval.OpenLongQuantity > 0
+                    ? baseRequest with { IsClosingLongPosition = true, OpenLongQuantity = armedEval.OpenLongQuantity }
+                    : baseRequest;
+
+                var pendingIntentRow = BuildPendingSubmitRow(
+                    proposal.ProposalId,
+                    ticker,
+                    proposal.Action,
+                    candidateRequest,
+                    clock.GetUtcNow());
+
+                var reservation = await auditStore.TryReserveOrderIntentAsync(
+                    pendingIntentRow,
+                    paperBrokerClient,
+                    clock,
+                    token);
+
+                if (reservation == OrderIntentReservationStatus.ReservedForSubmit)
+                {
+                    reservedExecRequest = candidateRequest;
+                }
+            }
+        }
+        finally
+        {
+            armedExecutionGate.Release();
         }
 
-        var violationsJson = JsonSerializer.Serialize(
-            riskDecision.Violations.Select(static v => new { code = v.Code.ToString(), message = v.Message }),
-            SentiXJson.Options);
-
-        var riskRow = new RiskEvaluationRow(
-            0,
-            proposal.ProposalId,
-            riskDecision.Approved,
-            riskDecision.EffectiveTradingState.ToString().ToUpperInvariant(),
-            violationsJson,
-            riskDecision.CalculatedQuantity,
-            riskDecision.ClampedStopLossPct is { } sl ? (double)sl : null,
-            riskDecision.ClampedTakeProfitPct is { } tp ? (double)tp : null,
-            riskDecision.ClientOrderId,
-            evaluatedAtUtc);
-
-        db.DecisionDebates.Add(debateRow);
-        db.RiskEvaluations.Add(riskRow);
-        await db.SaveChangesAsync(token);
-
-        if (isArmedPaperMode &&
-            paperExecution is not null &&
-            riskDecision.Approved &&
-            proposal.Action != DomainTradeAction.Hold &&
-            !string.IsNullOrWhiteSpace(riskDecision.ClientOrderId) &&
-            !string.IsNullOrWhiteSpace(ticker))
+        if (reservedExecRequest is not null && paperExecution is not null && !string.IsNullOrWhiteSpace(ticker))
         {
-            await ExecuteAndPersistPaperOrderWithWriteAheadAsync(
+            await SubmitReservedOrderAsync(
                 proposal.ProposalId,
                 ticker,
                 proposal.Action,
-                riskProposal,
-                riskDecision,
-                entryPrice,
-                openLongQuantity,
+                reservedExecRequest,
                 auditStore,
                 paperExecution,
                 clock,
@@ -336,26 +373,49 @@ public sealed class MarketEventPipeline(
         var allowedTickers = universe?.EquitiesSymbols.ToHashSet(StringComparer.OrdinalIgnoreCase)
             ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+        var brokerOrderIds = new HashSet<string>(StringComparer.Ordinal);
         var mergedPending = new Dictionary<string, PendingOrder>(StringComparer.Ordinal);
         foreach (var brokerOrder in accountSnapshot.PendingOrders)
         {
+            brokerOrderIds.Add(brokerOrder.ClientOrderId);
             mergedPending[brokerOrder.ClientOrderId] = brokerOrder;
         }
 
+        var localUnsubmittedBuyNotional = 0m;
+        var pendingBuyPricesByTicker = new Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase);
         var lastTradeTimes = new Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase);
+
         foreach (var localOrder in recentLocalOrders)
         {
             var status = localOrder.Status?.Trim().ToUpperInvariant() ?? string.Empty;
-            if (status == "PENDING_SUBMIT" && !mergedPending.ContainsKey(localOrder.ClientOrderId))
+            if (status == "PENDING_SUBMIT")
             {
                 var pendingSide = string.Equals(localOrder.Side, "SELL", StringComparison.OrdinalIgnoreCase)
                     ? RiskTradeAction.Sell
                     : RiskTradeAction.Buy;
-                mergedPending[localOrder.ClientOrderId] = new PendingOrder(
-                    localOrder.ClientOrderId,
-                    localOrder.Ticker,
-                    pendingSide,
-                    Math.Max(1, localOrder.Qty));
+                var pendingQty = Math.Max(1, localOrder.Qty);
+
+                if (!mergedPending.ContainsKey(localOrder.ClientOrderId))
+                {
+                    mergedPending[localOrder.ClientOrderId] = new PendingOrder(
+                        localOrder.ClientOrderId,
+                        localOrder.Ticker,
+                        pendingSide,
+                        pendingQty);
+                }
+
+                if (pendingSide == RiskTradeAction.Buy)
+                {
+                    var unitPrice = localOrder.LimitPrice ?? ResolveAskPrice(localOrder.Ticker, quoteCache);
+                    if (unitPrice > 0m)
+                    {
+                        pendingBuyPricesByTicker[localOrder.Ticker] = unitPrice;
+                        if (!brokerOrderIds.Contains(localOrder.ClientOrderId))
+                        {
+                            localUnsubmittedBuyNotional += pendingQty * unitPrice;
+                        }
+                    }
+                }
             }
 
             if (status is not ("REJECTED_PREFLIGHT" or "FAILED_BROKER") && !string.IsNullOrWhiteSpace(localOrder.Ticker))
@@ -374,14 +434,50 @@ public sealed class MarketEventPipeline(
             .Where(p => p.Quantity > 0 && string.Equals(p.Ticker, normalizedTicker, StringComparison.OrdinalIgnoreCase))
             .Sum(p => p.Quantity);
 
+        // For BUY proposals, include reserved/open pending BUY exposure (positions count + sector notional) and deduct
+        // local unsubmitted PENDING_SUBMIT BUY notional from buying power so concurrent proposals cannot over-allocate.
+        // For SELL proposals, keep strictly verified filled broker positions so unfilled pending BUYs can never authorize a SELL.
+        IReadOnlyList<OpenPosition> effectiveOpenPositions = accountSnapshot.OpenPositions;
+        if (proposal.Action == DomainTradeAction.Buy && mergedPending.Count > 0)
+        {
+            var positionsWithReservedBuys = new List<OpenPosition>(accountSnapshot.OpenPositions);
+            var existingPositionTickers = accountSnapshot.OpenPositions
+                .Select(static p => p.Ticker)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var pending in mergedPending.Values)
+            {
+                if (pending.Side != RiskTradeAction.Buy || existingPositionTickers.Contains(pending.Ticker))
+                {
+                    continue;
+                }
+
+                var estimatedPrice = pendingBuyPricesByTicker.TryGetValue(pending.Ticker, out var pPrice) && pPrice > 0m
+                    ? pPrice
+                    : ResolveAskPrice(pending.Ticker, quoteCache);
+                var reservedMarketValue = estimatedPrice > 0m ? pending.Quantity * estimatedPrice : 0m;
+                positionsWithReservedBuys.Add(new OpenPosition(
+                    pending.Ticker,
+                    AlpacaPaperPortfolioSnapshotProvider.ResolveSector(pending.Ticker, universe),
+                    pending.Quantity,
+                    reservedMarketValue,
+                    estimatedPrice));
+                existingPositionTickers.Add(pending.Ticker);
+            }
+
+            effectiveOpenPositions = positionsWithReservedBuys;
+        }
+
+        var effectiveBuyingPower = Math.Max(0m, accountSnapshot.BuyingPower - localUnsubmittedBuyNotional);
+
         var authoritativePortfolio = new PortfolioSnapshot(
             tradingState,
             accountSnapshot.Equity,
-            accountSnapshot.BuyingPower,
+            effectiveBuyingPower,
             accountSnapshot.DailyPnLPct,
             askPrice,
             targetSector,
-            accountSnapshot.OpenPositions,
+            effectiveOpenPositions,
             mergedPending.Values.ToArray(),
             lastTradeTimes);
 
@@ -402,27 +498,51 @@ public sealed class MarketEventPipeline(
         IPaperExecutionEngine executionEngine,
         TimeProvider clock,
         ILogger logger,
-        CancellationToken token)
+        CancellationToken token,
+        IAlpacaPaperBrokerClient? brokerClient = null)
     {
         var baseRequest = PaperOrderExecutionRequest.FromRiskDecision(riskProposal, riskDecision, entryPrice);
         var execRequest = action == DomainTradeAction.Sell && openLongQuantity > 0
             ? baseRequest with { IsClosingLongPosition = true, OpenLongQuantity = openLongQuantity }
             : baseRequest;
 
-        var intentTimestampUtc = clock.GetUtcNow();
         var pendingIntentRow = BuildPendingSubmitRow(
             proposalId,
             normalizedTicker,
             action,
             execRequest,
-            intentTimestampUtc);
+            clock.GetUtcNow());
 
-        var disposition = await orderAuditStore.TryBeginOrderIntentAsync(pendingIntentRow, token);
-        if (disposition != OrderIntentDisposition.ProceedToSubmit)
+        var reservation = await orderAuditStore.TryReserveOrderIntentAsync(pendingIntentRow, brokerClient, clock, token);
+        if (reservation != OrderIntentReservationStatus.ReservedForSubmit)
         {
             return;
         }
 
+        await SubmitReservedOrderAsync(
+            proposalId,
+            normalizedTicker,
+            action,
+            execRequest,
+            orderAuditStore,
+            executionEngine,
+            clock,
+            logger,
+            token);
+    }
+
+    private static async Task SubmitReservedOrderAsync(
+        string proposalId,
+        string normalizedTicker,
+        DomainTradeAction action,
+        PaperOrderExecutionRequest execRequest,
+        IPaperOrderAuditStore orderAuditStore,
+        IPaperExecutionEngine executionEngine,
+        TimeProvider clock,
+        ILogger logger,
+        CancellationToken token)
+    {
+        var expectedClientOrderId = execRequest.RiskDecision.ClientOrderId!;
         PaperExecutionResult execResult;
         try
         {
@@ -437,13 +557,13 @@ public sealed class MarketEventPipeline(
             logger.LogWarning(
                 "Paper order execution threw unexpectedly for ProposalId={ProposalId}, ClientOrderId={ClientOrderId} ({ErrorType}).",
                 proposalId,
-                pendingIntentRow.ClientOrderId,
+                expectedClientOrderId,
                 ex.GetType().Name);
             execResult = new PaperExecutionResult(
                 ExecutionOutcomeStatus.FailedBroker,
                 ExecutionRejectionCode.BrokerNetworkError,
                 $"Unexpected execution exception ({ex.GetType().Name}).",
-                pendingIntentRow.ClientOrderId,
+                expectedClientOrderId,
                 TradingState.HaltedSystemError,
                 Receipt: null,
                 BrokerResult: null,
@@ -459,6 +579,28 @@ public sealed class MarketEventPipeline(
             clock.GetUtcNow());
 
         await orderAuditStore.CompleteOrderIntentAsync(completedRow);
+    }
+
+    private static RiskEvaluationRow BuildRiskEvaluationRow(
+        string proposalId,
+        RiskDecision riskDecision,
+        DateTimeOffset evaluatedAtUtc)
+    {
+        var violationsJson = JsonSerializer.Serialize(
+            riskDecision.Violations.Select(static v => new { code = v.Code.ToString(), message = v.Message }),
+            SentiXJson.Options);
+
+        return new RiskEvaluationRow(
+            0,
+            proposalId,
+            riskDecision.Approved,
+            riskDecision.EffectiveTradingState.ToString().ToUpperInvariant(),
+            violationsJson,
+            riskDecision.CalculatedQuantity,
+            riskDecision.ClampedStopLossPct is { } sl ? (double)sl : null,
+            riskDecision.ClampedTakeProfitPct is { } tp ? (double)tp : null,
+            riskDecision.ClientOrderId,
+            evaluatedAtUtc);
     }
 
     internal static OrderRow BuildPendingSubmitRow(
@@ -617,5 +759,9 @@ public sealed class MarketEventPipeline(
             tickerQuote is { MidPrice: > 0m } ? tickerQuote.MidPrice : 0m;
     }
 
-    public void Dispose() => migration.Dispose();
+    public void Dispose()
+    {
+        migration.Dispose();
+        armedExecutionGate.Dispose();
+    }
 }

@@ -9,4 +9,7 @@ public interface IAlpacaPaperBrokerClient
 {
     /// <summary>Submits a validated paper order to Alpaca <c>POST /v2/orders</c>.</summary>
     Task<BrokerSubmissionResult> SubmitOrderAsync(AlpacaBracketOrderRequest order, CancellationToken cancellationToken);
+
+    /// <summary>Looks up a paper order via <c>GET /v2/orders:by_client_order_id?client_order_id=...</c>.</summary>
+    Task<BrokerOrderLookupResult> GetOrderByClientOrderIdAsync(string clientOrderId, CancellationToken cancellationToken);
 }

@@ -93,7 +93,8 @@ builder.Services.AddSingleton<IMarketEventPipeline>(services => new MarketEventP
     services.GetRequiredService<IPaperExecutionEngine>(),
     services.GetRequiredService<AlpacaPaperOptions>(),
     services.GetRequiredService<IPaperPortfolioSnapshotProvider>(),
-    services.GetRequiredService<IPaperOrderAuditStore>()));
+    services.GetRequiredService<IPaperOrderAuditStore>(),
+    services.GetRequiredService<IAlpacaPaperBrokerClient>()));
 
 builder.Services.AddSingleton(services =>
 {

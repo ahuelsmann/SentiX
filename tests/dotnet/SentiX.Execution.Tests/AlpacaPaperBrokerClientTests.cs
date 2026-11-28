@@ -330,4 +330,46 @@ public sealed class AlpacaPaperBrokerClientTests
         Assert.Equal("accepted", result.Receipt.Status);
         Assert.Equal(150.00m, result.Receipt.LimitPrice);
     }
+
+    [Fact]
+    public async Task GetOrderByClientOrderIdAsync_DistinguishesFoundNotFoundAndAmbiguousFailures()
+    {
+        const string cid = "SX-20261127-AAPL-BUY-01234567";
+        var statusToReturn = HttpStatusCode.OK;
+        var bodyToReturn = ExecutionTestFixtures.AcceptedOrderJson(cid);
+
+        var handler = new StubHttpMessageHandler(req =>
+        {
+            Assert.Equal(HttpMethod.Get, req.Method);
+            Assert.Equal(
+                new Uri($"https://paper-api.alpaca.markets/v2/orders:by_client_order_id?client_order_id={cid}"),
+                req.RequestUri);
+            return StubHttpMessageHandler.Json(statusToReturn, bodyToReturn);
+        });
+
+        var client = new AlpacaPaperBrokerClient(new HttpClient(handler), ExecutionTestFixtures.ReadyPaperOptions());
+
+        var found = await client.GetOrderByClientOrderIdAsync(cid, CancellationToken.None);
+        Assert.Equal(BrokerOrderLookupOutcome.Found, found.Outcome);
+        Assert.Equal("ord_paper_001", found.Receipt!.OrderId);
+
+        statusToReturn = HttpStatusCode.NotFound;
+        bodyToReturn = """{"message":"order not found"}""";
+        var notFound = await client.GetOrderByClientOrderIdAsync(cid, CancellationToken.None);
+        Assert.Equal(BrokerOrderLookupOutcome.NotFound, notFound.Outcome);
+        Assert.Null(notFound.Receipt);
+
+        statusToReturn = HttpStatusCode.ServiceUnavailable;
+        var ambiguous = await client.GetOrderByClientOrderIdAsync(cid, CancellationToken.None);
+        Assert.Equal(BrokerOrderLookupOutcome.AmbiguousFailure, ambiguous.Outcome);
+        Assert.Equal(ExecutionRejectionCode.BrokerServerError, ambiguous.FailureCode);
+
+        var liveOptions = ExecutionTestFixtures.ReadyPaperOptions();
+        liveOptions.BaseUrl = "https://api.alpaca.markets";
+        var liveHandler = new StubHttpMessageHandler(_ => throw new InvalidOperationException("Must not call live API."));
+        var liveClient = new AlpacaPaperBrokerClient(new HttpClient(liveHandler), liveOptions);
+        var blocked = await liveClient.GetOrderByClientOrderIdAsync(cid, CancellationToken.None);
+        Assert.Equal(BrokerOrderLookupOutcome.AmbiguousFailure, blocked.Outcome);
+        Assert.Equal(0, liveHandler.CallCount);
+    }
 }

@@ -175,6 +175,257 @@ public sealed class AlpacaPaperBrokerClient : IAlpacaPaperBrokerClient
         }
     }
 
+    /// <inheritdoc />
+    public async Task<BrokerOrderLookupResult> GetOrderByClientOrderIdAsync(
+        string clientOrderId,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (string.IsNullOrWhiteSpace(clientOrderId) ||
+            clientOrderId.Trim().Length > ClientOrderIdGenerator.MaxLength ||
+            clientOrderId.Trim().Any(static ch => char.IsWhiteSpace(ch) || char.IsControl(ch)))
+        {
+            return new BrokerOrderLookupResult(
+                BrokerOrderLookupOutcome.AmbiguousFailure,
+                null,
+                ExecutionRejectionCode.InvalidClientOrderId,
+                "client_order_id is missing or invalid for broker lookup.",
+                null);
+        }
+
+        if (!_options.TryValidateReadyToTrade(out var optionsCode, out var optionsError))
+        {
+            return new BrokerOrderLookupResult(
+                BrokerOrderLookupOutcome.AmbiguousFailure,
+                null,
+                optionsCode,
+                optionsError,
+                null);
+        }
+
+        if (_httpClient.BaseAddress is not null && !AlpacaPaperOptions.IsAllowedPaperBaseUri(_httpClient.BaseAddress))
+        {
+            return new BrokerOrderLookupResult(
+                BrokerOrderLookupOutcome.AmbiguousFailure,
+                null,
+                ExecutionRejectionCode.InvalidBaseUrl,
+                "Injected HttpClient BaseAddress is not strictly https://paper-api.alpaca.markets.",
+                null);
+        }
+
+        if (!AlpacaPaperOptions.TryResolvePaperBaseUri(_options.BaseUrl, out var baseUri))
+        {
+            return new BrokerOrderLookupResult(
+                BrokerOrderLookupOutcome.AmbiguousFailure,
+                null,
+                ExecutionRejectionCode.InvalidBaseUrl,
+                "Alpaca BaseUrl failed strict paper endpoint resolution.",
+                null);
+        }
+
+        var trimmedId = clientOrderId.Trim();
+        var expectedPathAndQuery = $"/v2/orders:by_client_order_id?client_order_id={Uri.EscapeDataString(trimmedId)}";
+        var requestUri = new Uri(baseUri, expectedPathAndQuery.TrimStart('/'));
+        if (!IsAllowedPaperOrderLookupUri(requestUri, expectedPathAndQuery))
+        {
+            return new BrokerOrderLookupResult(
+                BrokerOrderLookupOutcome.AmbiguousFailure,
+                null,
+                ExecutionRejectionCode.InvalidBaseUrl,
+                "Resolved order lookup URI failed strict paper endpoint validation.",
+                null);
+        }
+
+        using var request = new HttpRequestMessage(HttpMethod.Get, requestUri);
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        request.Headers.TryAddWithoutValidation("APCA-API-KEY-ID", _options.ApiKey.Trim());
+        request.Headers.TryAddWithoutValidation("APCA-API-SECRET-KEY", _options.SecretKey.Trim());
+
+        if (!IsAllowedPaperOrderLookupUri(request.RequestUri, expectedPathAndQuery))
+        {
+            return new BrokerOrderLookupResult(
+                BrokerOrderLookupOutcome.AmbiguousFailure,
+                null,
+                ExecutionRejectionCode.InvalidBaseUrl,
+                "Final pre-dispatch lookup RequestUri guard rejected non-paper URI.",
+                null);
+        }
+
+        using var timeoutCts = new CancellationTokenSource(_options.RequestTimeout, _timeProvider);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
+
+        try
+        {
+            using var response = await _httpClient
+                .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, linkedCts.Token)
+                .ConfigureAwait(false);
+
+            if (response.StatusCode == HttpStatusCode.NotFound)
+            {
+                return new BrokerOrderLookupResult(
+                    BrokerOrderLookupOutcome.NotFound,
+                    HttpStatusCode.NotFound,
+                    ExecutionRejectionCode.None,
+                    null,
+                    null);
+            }
+
+            var code = (int)response.StatusCode;
+            if (!IsSuccessStatusCode(code))
+            {
+                var failureCode = response.StatusCode == HttpStatusCode.TooManyRequests
+                    ? ExecutionRejectionCode.BrokerRateLimited
+                    : code >= 500
+                        ? ExecutionRejectionCode.BrokerServerError
+                        : ExecutionRejectionCode.BrokerRejected;
+                return new BrokerOrderLookupResult(
+                    BrokerOrderLookupOutcome.AmbiguousFailure,
+                    response.StatusCode,
+                    failureCode,
+                    FormattableString.Invariant($"HTTP {code} during order lookup."),
+                    null);
+            }
+
+            var bodyResult = await ReadCappedBodyAsync(response.Content, linkedCts.Token).ConfigureAwait(false);
+            if (!bodyResult.Success || string.IsNullOrWhiteSpace(bodyResult.Body))
+            {
+                return new BrokerOrderLookupResult(
+                    BrokerOrderLookupOutcome.AmbiguousFailure,
+                    response.StatusCode,
+                    ExecutionRejectionCode.MalformedBrokerResponse,
+                    bodyResult.Error ?? "Empty broker lookup response.",
+                    null);
+            }
+
+            return ParseLookupReceipt(response.StatusCode, bodyResult.Body, trimmedId);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or TimeoutException)
+        {
+            _logger.LogWarning("Alpaca Paper order lookup timed out for {ClientOrderId}.", trimmedId);
+            return new BrokerOrderLookupResult(
+                BrokerOrderLookupOutcome.AmbiguousFailure,
+                null,
+                ExecutionRejectionCode.BrokerTimeout,
+                "Alpaca Paper order lookup timed out.",
+                null);
+        }
+        catch (HttpRequestException ex)
+        {
+            _logger.LogWarning("Alpaca Paper order lookup network error for {ClientOrderId}: {ErrorType}.", trimmedId, ex.GetType().Name);
+            return new BrokerOrderLookupResult(
+                BrokerOrderLookupOutcome.AmbiguousFailure,
+                ex.StatusCode,
+                ExecutionRejectionCode.BrokerNetworkError,
+                $"Alpaca Paper order lookup network failure ({ex.GetType().Name}).",
+                null);
+        }
+        catch (IOException ex)
+        {
+            _logger.LogWarning("Alpaca Paper order lookup stream error for {ClientOrderId}: {ErrorType}.", trimmedId, ex.GetType().Name);
+            return new BrokerOrderLookupResult(
+                BrokerOrderLookupOutcome.AmbiguousFailure,
+                null,
+                ExecutionRejectionCode.BrokerNetworkError,
+                $"Alpaca Paper order lookup stream failure ({ex.GetType().Name}).",
+                null);
+        }
+    }
+
+    internal static bool IsAllowedPaperOrderLookupUri(Uri? uri, string expectedPathAndQuery)
+    {
+        if (uri is null || !uri.IsAbsoluteUri)
+        {
+            return false;
+        }
+
+        if (!string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ||
+            !uri.IsDefaultPort ||
+            !string.IsNullOrEmpty(uri.UserInfo) ||
+            !string.IsNullOrEmpty(uri.Fragment))
+        {
+            return false;
+        }
+
+        if (!string.Equals(uri.Host, AlpacaPaperOptions.AllowedPaperHost, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(uri.IdnHost, AlpacaPaperOptions.AllowedPaperHost, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return string.Equals(uri.AbsolutePath, "/v2/orders:by_client_order_id", StringComparison.Ordinal) &&
+               string.Equals(uri.PathAndQuery, expectedPathAndQuery, StringComparison.Ordinal);
+    }
+
+    private static BrokerOrderLookupResult ParseLookupReceipt(
+        HttpStatusCode statusCode,
+        string body,
+        string expectedClientOrderId)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                return new BrokerOrderLookupResult(
+                    BrokerOrderLookupOutcome.AmbiguousFailure,
+                    statusCode,
+                    ExecutionRejectionCode.MalformedBrokerResponse,
+                    "Broker lookup returned non-object JSON.",
+                    null);
+            }
+
+            var root = doc.RootElement;
+            if (!TryReadRequiredString(root, "id", out var orderId) ||
+                !TryReadRequiredString(root, "client_order_id", out var clientOrderId) ||
+                !TryReadRequiredString(root, "symbol", out var symbol) ||
+                !TryReadRequiredString(root, "status", out var status) ||
+                !string.Equals(clientOrderId, expectedClientOrderId, StringComparison.Ordinal))
+            {
+                return new BrokerOrderLookupResult(
+                    BrokerOrderLookupOutcome.AmbiguousFailure,
+                    statusCode,
+                    ExecutionRejectionCode.MalformedBrokerResponse,
+                    "Broker lookup receipt is missing required fields or has mismatched client_order_id.",
+                    null);
+            }
+
+            var receipt = new AlpacaOrderReceipt(
+                orderId,
+                clientOrderId,
+                symbol.ToUpperInvariant(),
+                status,
+                ReadOptionalString(root, "side") ?? string.Empty,
+                ReadOptionalString(root, "type") ?? string.Empty,
+                ReadOptionalString(root, "order_class"),
+                ReadOptionalString(root, "qty"),
+                ReadOptionalDecimal(root, "limit_price"),
+                ReadOptionalDecimal(root, "filled_avg_price"),
+                ReadOptionalTimestamp(root, "submitted_at"),
+                ReadOptionalTimestamp(root, "created_at"));
+
+            return new BrokerOrderLookupResult(
+                BrokerOrderLookupOutcome.Found,
+                statusCode,
+                ExecutionRejectionCode.None,
+                null,
+                receipt);
+        }
+        catch (JsonException)
+        {
+            return new BrokerOrderLookupResult(
+                BrokerOrderLookupOutcome.AmbiguousFailure,
+                statusCode,
+                ExecutionRejectionCode.MalformedBrokerResponse,
+                "Broker lookup returned malformed JSON.",
+                null);
+        }
+    }
+
     private BrokerSubmissionResult MapResponse(
         HttpStatusCode statusCode,
         string body,

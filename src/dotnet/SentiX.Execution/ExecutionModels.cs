@@ -266,6 +266,27 @@ public sealed record BrokerSubmissionResult(
     string? FailureReason,
     AlpacaOrderReceipt? Receipt);
 
+/// <summary>Outcome of looking up an Alpaca Paper order by deterministic <c>client_order_id</c>.</summary>
+public enum BrokerOrderLookupOutcome
+{
+    /// <summary>Order exists on Alpaca Paper API (HTTP 200 valid receipt).</summary>
+    Found,
+
+    /// <summary>Alpaca Paper API definitively reported HTTP 404 Not Found.</summary>
+    NotFound,
+
+    /// <summary>Lookup could not definitively determine order existence (config, network, timeout, 429/5xx, or malformed JSON).</summary>
+    AmbiguousFailure
+}
+
+/// <summary>Non-throwing structured outcome of <see cref="IAlpacaPaperBrokerClient.GetOrderByClientOrderIdAsync"/>.</summary>
+public sealed record BrokerOrderLookupResult(
+    BrokerOrderLookupOutcome Outcome,
+    System.Net.HttpStatusCode? StatusCode,
+    ExecutionRejectionCode FailureCode,
+    string? FailureReason,
+    AlpacaOrderReceipt? Receipt);
+
 /// <summary>Non-throwing structured outcome returned by <see cref="PaperExecutionEngine"/>.</summary>
 public sealed record PaperExecutionResult(
     ExecutionOutcomeStatus Status,

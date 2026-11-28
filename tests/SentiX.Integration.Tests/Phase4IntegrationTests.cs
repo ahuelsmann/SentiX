@@ -295,7 +295,101 @@ public sealed class Phase4IntegrationTests
     }
 
     [Fact]
-    public async Task WriteAheadOrderIntent_BlocksBrokerOnInsertFailure_AndPreservesPendingSubmitWhenPostUpdateFails()
+    public async Task ArmedExecutionGate_SerializesConcurrentProposals_PreventingJointExposureBreach()
+    {
+        var universe = UniverseConfigLoader.Load(UniverseAndXTests.UniversePath);
+        var quotes = new InMemoryMarketQuoteCache();
+        quotes.Update(new MarketQuoteSnapshot("AAPL", 199.90m, 200.00m, 199.95m, 5.0, FixedRegularMarketUtc));
+        quotes.Update(new MarketQuoteSnapshot("MSFT", 249.90m, 250.00m, 249.95m, 4.0, FixedRegularMarketUtc));
+
+        // Account already holds $20,000 (20%) in TECH (XLK). MaxSectorExposurePct is 25% ($25,000).
+        // AAPL ($5,000) and MSFT ($5,000) each individually fit (20% + 5% = 25%),
+        // but jointly they would reach 30% (> 25%) if unserialized!
+        var portfolioProvider = new StubPaperPortfolioProvider(_ => PaperAccountSnapshotResult.Success(new PaperAccountSnapshot(
+            Equity: 100_000m,
+            LastEquity: 100_000m,
+            BuyingPower: 100_000m,
+            DailyPnLPct: 0.0,
+            OpenPositions: [new SentiX.Risk.OpenPosition("XLK", "TECH", 100, 20_000m, 200m)],
+            PendingOrders: [],
+            FetchedAtUtc: FixedRegularMarketUtc)));
+
+        var auditStore = new InMemoryOrderAuditStore();
+        var firstSubmitEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var allowFirstSubmitFinish = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var submitCalls = 0;
+
+        var slowExecutionEngine = new AsyncStubPaperExecutionEngine(async (req, _) =>
+        {
+            var count = Interlocked.Increment(ref submitCalls);
+            firstSubmitEntered.TrySetResult();
+            await allowFirstSubmitFinish.Task;
+            return new PaperExecutionResult(
+                ExecutionOutcomeStatus.Submitted,
+                ExecutionRejectionCode.None,
+                null,
+                req.RiskDecision.ClientOrderId,
+                RiskTradingState.Active,
+                new AlpacaOrderReceipt(
+                    $"alp-conc-{count}", req.RiskDecision.ClientOrderId!, req.Proposal.Ticker, "accepted",
+                    "buy", "limit", "bracket", req.RiskDecision.CalculatedQuantity.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    req.LimitPrice, null, FixedRegularMarketUtc, FixedRegularMarketUtc),
+                null,
+                FixedRegularMarketUtc);
+        });
+
+        using var pipeline = new MarketEventPipeline(
+            new ThrowingContextFactory(),
+            new NativeBridgeClient(Path.Combine(Path.GetTempPath(), $"sx-conc-{Guid.NewGuid():N}.sock")),
+            NullLogger<MarketEventPipeline>.Instance,
+            isConfigured: true,
+            quoteCache: quotes,
+            universe: universe,
+            timeProvider: new FixedClock(FixedRegularMarketUtc),
+            paperExecution: slowExecutionEngine,
+            paperOptions: new AlpacaPaperOptions { TradingEnabled = true },
+            paperPortfolioProvider: portfolioProvider,
+            orderAuditStore: auditStore);
+
+        var aaplProposal = new TradeProposal(
+            "prop_conc_aapl", "evt_conc_1", TradeAction.Buy, "AAPL", InstrumentType.Equity,
+            0.91, 24, 0.03m, 0.06m, "AAPL catalyst", "None");
+        var msftProposal = new TradeProposal(
+            "prop_conc_msft", "evt_conc_2", TradeAction.Buy, "MSFT", InstrumentType.Equity,
+            0.91, 24, 0.03m, 0.06m, "MSFT catalyst", "None");
+
+        var recordedRiskRows = new System.Collections.Concurrent.ConcurrentBag<RiskEvaluationRow>();
+
+        var task1 = pipeline.ExecuteArmedEvaluationAndOrderAsync(
+            aaplProposal, "AAPL", FixedRegularMarketUtc,
+            _ => Task.FromResult<string?>("ACTIVE"),
+            (row, _) => { recordedRiskRows.Add(row); return Task.CompletedTask; },
+            CancellationToken.None);
+
+        await firstSubmitEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Launch second concurrent proposal while first broker submission is STILL in-flight!
+        var task2 = pipeline.ExecuteArmedEvaluationAndOrderAsync(
+            msftProposal, "MSFT", FixedRegularMarketUtc,
+            _ => Task.FromResult<string?>("ACTIVE"),
+            (row, _) => { recordedRiskRows.Add(row); return Task.CompletedTask; },
+            CancellationToken.None);
+
+        await task2.WaitAsync(TimeSpan.FromSeconds(5));
+        allowFirstSubmitFinish.TrySetResult();
+        await task1.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(1, submitCalls);
+        Assert.Equal(2, recordedRiskRows.Count);
+        Assert.Single(recordedRiskRows, r => r.Approved);
+        var rejectedRisk = Assert.Single(recordedRiskRows, r => !r.Approved);
+        Assert.Contains("SectorExposureExceeded", rejectedRisk.Violations, StringComparison.Ordinal);
+        Assert.Single(auditStore.Rows.Values);
+        Assert.Equal("ACCEPTED", Assert.Single(auditStore.Rows.Values).Status);
+    }
+
+    [Fact]
+    public async Task WriteAheadOrderIntent_EnforcesSingleWriterLease_SafeBrokerReconciliation_FencedCompletion_AndUnboundedPendingRetention()
     {
         var universe = UniverseConfigLoader.Load(UniverseAndXTests.UniversePath);
         var quotes = new InMemoryMarketQuoteCache();
@@ -307,10 +401,10 @@ public sealed class Phase4IntegrationTests
             proposal, "AAPL", quotes, universe, RiskTradingState.Active, FixedRegularMarketUtc);
         Assert.True(riskDecision.Approved);
 
-        var engineCalls = 0;
+        var submitCalls = 0;
         var fakeEngine = new StubPaperExecutionEngine(req =>
         {
-            engineCalls++;
+            submitCalls++;
             return new PaperExecutionResult(
                 ExecutionOutcomeStatus.Submitted,
                 ExecutionRejectionCode.None,
@@ -329,31 +423,87 @@ public sealed class Phase4IntegrationTests
         await MarketEventPipeline.ExecuteAndPersistPaperOrderWithWriteAheadAsync(
             proposal.ProposalId, "AAPL", proposal.Action, riskProposal, riskDecision, entryPrice, 0,
             failBeginStore, fakeEngine, new FixedClock(FixedRegularMarketUtc), NullLogger.Instance, CancellationToken.None);
-        Assert.Equal(0, engineCalls);
+        Assert.Equal(0, submitCalls);
         Assert.Empty(failBeginStore.Rows);
 
         // (b) Broker accepts order + post-submit DB update fails -> durable PENDING_SUBMIT row remains visible!
-        var failCompleteStore = new InMemoryOrderAuditStore { FailComplete = true };
+        var store = new InMemoryOrderAuditStore { FailComplete = true };
         await MarketEventPipeline.ExecuteAndPersistPaperOrderWithWriteAheadAsync(
             proposal.ProposalId, "AAPL", proposal.Action, riskProposal, riskDecision, entryPrice, 0,
-            failCompleteStore, fakeEngine, new FixedClock(FixedRegularMarketUtc), NullLogger.Instance, CancellationToken.None);
-        Assert.Equal(1, engineCalls);
-        var durablePending = Assert.Single(failCompleteStore.Rows.Values);
+            store, fakeEngine, new FixedClock(FixedRegularMarketUtc), NullLogger.Instance, CancellationToken.None);
+        Assert.Equal(1, submitCalls);
+        var durablePending = Assert.Single(store.Rows.Values);
         Assert.Equal(riskDecision.ClientOrderId, durablePending.ClientOrderId);
         Assert.Equal("PENDING_SUBMIT", durablePending.Status);
 
-        // (c) Interrupted PENDING_SUBMIT reconciles on retry and transitions to ACCEPTED, then subsequent replay skips with 0 extra calls!
-        failCompleteStore.FailComplete = false;
-        await MarketEventPipeline.ExecuteAndPersistPaperOrderWithWriteAheadAsync(
-            proposal.ProposalId, "AAPL", proposal.Action, riskProposal, riskDecision, entryPrice, 0,
-            failCompleteStore, fakeEngine, new FixedClock(FixedRegularMarketUtc.AddSeconds(5)), NullLogger.Instance, CancellationToken.None);
-        Assert.Equal(2, engineCalls);
-        Assert.Equal("ACCEPTED", Assert.Single(failCompleteStore.Rows.Values).Status);
+        // (c / H2a) Active PENDING_SUBMIT lease (< 60s old) MUST NOT trigger a second SubmitOrderAsync!
+        store.FailComplete = false;
+        var lookupCalls = 0;
+        var brokerLookupStub = new RecordingBrokerClient(
+            _ => throw new InvalidOperationException("SubmitOrderAsync must not be called during reconciliation."),
+            cid =>
+            {
+                lookupCalls++;
+                return new BrokerOrderLookupResult(
+                    BrokerOrderLookupOutcome.Found,
+                    HttpStatusCode.OK,
+                    ExecutionRejectionCode.None,
+                    null,
+                    new AlpacaOrderReceipt(
+                        "alp-reconciled-99", cid, "AAPL", "accepted", "buy", "limit",
+                        "bracket", "25", 200m, null, FixedRegularMarketUtc, FixedRegularMarketUtc));
+            });
 
         await MarketEventPipeline.ExecuteAndPersistPaperOrderWithWriteAheadAsync(
             proposal.ProposalId, "AAPL", proposal.Action, riskProposal, riskDecision, entryPrice, 0,
-            failCompleteStore, fakeEngine, new FixedClock(FixedRegularMarketUtc.AddSeconds(10)), NullLogger.Instance, CancellationToken.None);
-        Assert.Equal(2, engineCalls); // Skipped because already ACCEPTED!
+            store, fakeEngine, new FixedClock(FixedRegularMarketUtc.AddSeconds(15)), NullLogger.Instance, CancellationToken.None, brokerLookupStub);
+        Assert.Equal(1, submitCalls); // Still 1: active lease prevented blind resubmit!
+        Assert.Equal(0, lookupCalls);
+        Assert.Equal("PENDING_SUBMIT", Assert.Single(store.Rows.Values).Status);
+
+        // (d / H2b) Expired PENDING_SUBMIT lease (> 60s old) reconciles via GetOrderByClientOrderIdAsync (HTTP 200)
+        // into ACCEPTED WITHOUT calling SubmitOrderAsync!
+        await MarketEventPipeline.ExecuteAndPersistPaperOrderWithWriteAheadAsync(
+            proposal.ProposalId, "AAPL", proposal.Action, riskProposal, riskDecision, entryPrice, 0,
+            store, fakeEngine, new FixedClock(FixedRegularMarketUtc.AddSeconds(65)), NullLogger.Instance, CancellationToken.None, brokerLookupStub);
+        Assert.Equal(1, submitCalls); // ZERO extra SubmitOrderAsync calls!
+        Assert.Equal(1, lookupCalls);
+        var reconciled = Assert.Single(store.Rows.Values);
+        Assert.Equal("ACCEPTED", reconciled.Status);
+        Assert.Equal("alp-reconciled-99", reconciled.AlpacaOrderId);
+
+        // (e / H2c) Late duplicate/error CompleteOrderIntentAsync CANNOT overwrite an already-persisted ACCEPTED receipt!
+        await store.CompleteOrderIntentAsync(reconciled with
+        {
+            AlpacaOrderId = null,
+            Status = "FAILED_BROKER",
+            UpdatedAtUtc = FixedRegularMarketUtc.AddMinutes(5)
+        });
+        var preserved = Assert.Single(store.Rows.Values);
+        Assert.Equal("ACCEPTED", preserved.Status);
+        Assert.Equal("alp-reconciled-99", preserved.AlpacaOrderId);
+
+        // (f / M1) Unresolved PENDING_SUBMIT older than 48h (72h old) is STILL retained in GetRecentOrdersAsync and PendingOrders risk input!
+        var stale72hUtc = FixedRegularMarketUtc.AddHours(-72);
+        var m1Store = new InMemoryOrderAuditStore();
+        m1Store.Rows["SX-20260601-AAPL-BUY-stale72h"] = new OrderRow(
+            "SX-20260601-AAPL-BUY-stale72h", null, "prop_old_pending", "AAPL", "BUY", "LIMIT",
+            25, 200m, 194m, 212m, "PENDING_SUBMIT", null, stale72hUtc, stale72hUtc);
+        m1Store.Rows["SX-20260601-MSFT-BUY-oldfilled"] = new OrderRow(
+            "SX-20260601-MSFT-BUY-oldfilled", "alp-old", "prop_old_filled", "MSFT", "BUY", "LIMIT",
+            20, 250m, 242.5m, 265m, "FILLED", 250m, stale72hUtc, stale72hUtc);
+
+        var retained = await m1Store.GetRecentOrdersAsync(FixedRegularMarketUtc.AddHours(-48), CancellationToken.None);
+        Assert.True(retained.IsSuccess);
+        var retainedRow = Assert.Single(retained.Orders); // 72h FILLED row filtered out; 72h PENDING_SUBMIT retained!
+        Assert.Equal("SX-20260601-AAPL-BUY-stale72h", retainedRow.ClientOrderId);
+
+        var emptyBrokerAccount = new PaperAccountSnapshot(
+            100_000m, 100_000m, 100_000m, 0.0, [], [], FixedRegularMarketUtc);
+        var (_, _, m1Decision, _) = MarketEventPipeline.EvaluateArmedHardRiskFromSnapshots(
+            proposal, "AAPL", quotes, universe, RiskTradingState.Active, emptyBrokerAccount, retained.Orders, FixedRegularMarketUtc);
+        Assert.False(m1Decision.Approved);
+        Assert.Contains(m1Decision.Violations, v => v.Code == SentiX.Risk.RiskViolationCode.DuplicatePosition);
     }
 
     [Fact]
@@ -667,7 +817,8 @@ public sealed class Phase4IntegrationTests
                 factory.Services.GetRequiredService<IPaperExecutionEngine>(),
                 factory.Services.GetRequiredService<AlpacaPaperOptions>(),
                 factory.Services.GetRequiredService<IPaperPortfolioSnapshotProvider>(),
-                factory.Services.GetRequiredService<IPaperOrderAuditStore>());
+                factory.Services.GetRequiredService<IPaperOrderAuditStore>(),
+                factory.Services.GetRequiredService<IAlpacaPaperBrokerClient>());
 
             var marketEvent = new MarketEvent(
                 "evt_pg_1",
@@ -803,10 +954,17 @@ public sealed class Phase4IntegrationTests
         public override DateTimeOffset GetUtcNow() => utcNow;
     }
 
-    private sealed class RecordingBrokerClient(Func<AlpacaBracketOrderRequest, BrokerSubmissionResult> handler) : IAlpacaPaperBrokerClient
+    private sealed class RecordingBrokerClient(
+        Func<AlpacaBracketOrderRequest, BrokerSubmissionResult> submitHandler,
+        Func<string, BrokerOrderLookupResult>? lookupHandler = null) : IAlpacaPaperBrokerClient
     {
         public Task<BrokerSubmissionResult> SubmitOrderAsync(AlpacaBracketOrderRequest order, CancellationToken cancellationToken) =>
-            Task.FromResult(handler(order));
+            Task.FromResult(submitHandler(order));
+
+        public Task<BrokerOrderLookupResult> GetOrderByClientOrderIdAsync(string clientOrderId, CancellationToken cancellationToken) =>
+            Task.FromResult(lookupHandler is not null
+                ? lookupHandler(clientOrderId)
+                : new BrokerOrderLookupResult(BrokerOrderLookupOutcome.NotFound, HttpStatusCode.NotFound, ExecutionRejectionCode.None, null, null));
     }
 
     private sealed class StubPaperPortfolioProvider(Func<UniverseConfig?, PaperAccountSnapshotResult> handler) : IPaperPortfolioSnapshotProvider
@@ -826,42 +984,98 @@ public sealed class Phase4IntegrationTests
             Task.FromResult(handler(request));
     }
 
+    private sealed class AsyncStubPaperExecutionEngine(
+        Func<PaperOrderExecutionRequest, CancellationToken, Task<PaperExecutionResult>> handler) : IPaperExecutionEngine
+    {
+        public Task<PaperExecutionResult> ExecuteAsync(PaperOrderExecutionRequest request, CancellationToken cancellationToken) =>
+            handler(request, cancellationToken);
+    }
+
     private sealed class InMemoryOrderAuditStore : IPaperOrderAuditStore
     {
+        private readonly object gate = new();
         public Dictionary<string, OrderRow> Rows { get; } = new(StringComparer.Ordinal);
         public bool FailBegin { get; set; }
         public bool FailComplete { get; set; }
 
-        public Task<RecentOrderAuditReadResult> GetRecentOrdersAsync(DateTimeOffset sinceUtc, CancellationToken cancellationToken) =>
-            Task.FromResult(new RecentOrderAuditReadResult(true, Rows.Values.Where(r => r.UpdatedAtUtc >= sinceUtc).ToArray()));
-
-        public Task<OrderIntentDisposition> TryBeginOrderIntentAsync(OrderRow pendingIntentRow, CancellationToken cancellationToken)
+        public Task<RecentOrderAuditReadResult> GetRecentOrdersAsync(DateTimeOffset finalizedSinceUtc, CancellationToken cancellationToken)
         {
-            if (FailBegin)
+            lock (gate)
             {
-                return Task.FromResult(OrderIntentDisposition.FailedClosed);
+                var rows = Rows.Values
+                    .Where(r => r.Status == "PENDING_SUBMIT" || r.UpdatedAtUtc >= finalizedSinceUtc)
+                    .ToArray();
+                return Task.FromResult(new RecentOrderAuditReadResult(true, rows));
             }
+        }
 
-            if (Rows.TryGetValue(pendingIntentRow.ClientOrderId, out var existing))
+        public async Task<OrderIntentReservationStatus> TryReserveOrderIntentAsync(
+            OrderRow pendingIntentRow,
+            IAlpacaPaperBrokerClient? brokerClient,
+            TimeProvider clock,
+            CancellationToken cancellationToken)
+        {
+            OrderRow? expiredToReconcile = null;
+            var nowUtc = clock.GetUtcNow();
+
+            lock (gate)
             {
-                if (string.Equals(existing.Status, "PENDING_SUBMIT", StringComparison.OrdinalIgnoreCase))
+                if (FailBegin)
                 {
-                    Rows[pendingIntentRow.ClientOrderId] = existing with { UpdatedAtUtc = pendingIntentRow.UpdatedAtUtc };
-                    return Task.FromResult(OrderIntentDisposition.ProceedToSubmit);
+                    return OrderIntentReservationStatus.FailedClosed;
                 }
 
-                return Task.FromResult(OrderIntentDisposition.AlreadyFinalizedSkip);
+                if (!Rows.TryGetValue(pendingIntentRow.ClientOrderId, out var existing))
+                {
+                    Rows[pendingIntentRow.ClientOrderId] = pendingIntentRow;
+                    return OrderIntentReservationStatus.ReservedForSubmit;
+                }
+
+                if (!string.Equals(existing.Status, "PENDING_SUBMIT", StringComparison.Ordinal))
+                {
+                    return OrderIntentReservationStatus.AlreadyFinalizedOrClaimed;
+                }
+
+                if (existing.UpdatedAtUtc > nowUtc - EfCorePaperOrderAuditStore.PendingSubmitLeaseDuration || brokerClient is null)
+                {
+                    return OrderIntentReservationStatus.AlreadyFinalizedOrClaimed;
+                }
+
+                // Fenced CAS claim on expired PENDING_SUBMIT lease
+                var claimed = existing with { UpdatedAtUtc = nowUtc };
+                Rows[pendingIntentRow.ClientOrderId] = claimed;
+                expiredToReconcile = claimed;
             }
 
-            Rows[pendingIntentRow.ClientOrderId] = pendingIntentRow;
-            return Task.FromResult(OrderIntentDisposition.ProceedToSubmit);
+            var lookup = await brokerClient!.GetOrderByClientOrderIdAsync(expiredToReconcile.ClientOrderId, cancellationToken);
+            if (lookup.Outcome == BrokerOrderLookupOutcome.Found && lookup.Receipt is not null)
+            {
+                await CompleteOrderIntentAsync(expiredToReconcile with
+                {
+                    AlpacaOrderId = lookup.Receipt.OrderId.Trim(),
+                    Status = lookup.Receipt.Status.Trim().ToUpperInvariant(),
+                    FilledAvgPrice = lookup.Receipt.FilledAvgPrice,
+                    SubmittedAtUtc = lookup.Receipt.SubmittedAtUtc ?? nowUtc,
+                    UpdatedAtUtc = clock.GetUtcNow()
+                });
+                return OrderIntentReservationStatus.ReconciledExistingReceipt;
+            }
+
+            return lookup.Outcome == BrokerOrderLookupOutcome.NotFound
+                ? OrderIntentReservationStatus.ReservedForSubmit
+                : OrderIntentReservationStatus.AlreadyFinalizedOrClaimed;
         }
 
         public Task CompleteOrderIntentAsync(OrderRow completedRow)
         {
-            if (!FailComplete)
+            lock (gate)
             {
-                Rows[completedRow.ClientOrderId] = completedRow;
+                if (!FailComplete &&
+                    Rows.TryGetValue(completedRow.ClientOrderId, out var existing) &&
+                    string.Equals(existing.Status, "PENDING_SUBMIT", StringComparison.Ordinal))
+                {
+                    Rows[completedRow.ClientOrderId] = completedRow;
+                }
             }
 
             return Task.CompletedTask;

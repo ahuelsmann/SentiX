@@ -1,14 +1,16 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using SentiX.Execution;
 using SentiX.Infrastructure;
 
 namespace SentiX.Ingestion;
 
-public enum OrderIntentDisposition
+public enum OrderIntentReservationStatus
 {
-    ProceedToSubmit,
-    AlreadyFinalizedSkip,
+    ReservedForSubmit,
+    ReconciledExistingReceipt,
+    AlreadyFinalizedOrClaimed,
     FailedClosed
 }
 
@@ -19,8 +21,26 @@ public sealed record RecentOrderAuditReadResult(
 
 public interface IPaperOrderAuditStore
 {
-    Task<RecentOrderAuditReadResult> GetRecentOrdersAsync(DateTimeOffset sinceUtc, CancellationToken cancellationToken);
-    Task<OrderIntentDisposition> TryBeginOrderIntentAsync(OrderRow pendingIntentRow, CancellationToken cancellationToken);
+    /// <summary>
+    /// Returns ALL unresolved <c>PENDING_SUBMIT</c> intents regardless of age, plus finalized orders
+    /// updated on or after <paramref name="finalizedSinceUtc"/> for ticker cooldown checks.
+    /// </summary>
+    Task<RecentOrderAuditReadResult> GetRecentOrdersAsync(DateTimeOffset finalizedSinceUtc, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Atomically reserves a single-writer <c>PENDING_SUBMIT</c> intent, or safely reconciles an expired orphaned
+    /// <c>PENDING_SUBMIT</c> via <paramref name="brokerClient"/> under a fenced compare-and-swap lease without blind resubmission.
+    /// </summary>
+    Task<OrderIntentReservationStatus> TryReserveOrderIntentAsync(
+        OrderRow pendingIntentRow,
+        IAlpacaPaperBrokerClient? brokerClient,
+        TimeProvider clock,
+        CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Finalizes an in-flight order row conditionally (<c>WHERE status = 'PENDING_SUBMIT'</c>) using <see cref="CancellationToken.None"/>
+    /// with a bounded command timeout so an already-finalized receipt can never be overwritten.
+    /// </summary>
     Task CompleteOrderIntentAsync(OrderRow completedRow);
 }
 
@@ -28,12 +48,14 @@ public sealed class EfCorePaperOrderAuditStore(
     IDbContextFactory<SentiXDbContext> dbFactory,
     ILogger? logger = null) : IPaperOrderAuditStore
 {
+    public static readonly TimeSpan PendingSubmitLeaseDuration = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan PostSubmitCompletionTimeout = TimeSpan.FromSeconds(10);
+
     private readonly IDbContextFactory<SentiXDbContext> dbFactory = dbFactory ?? throw new ArgumentNullException(nameof(dbFactory));
     private readonly ILogger log = logger ?? NullLogger.Instance;
 
     public async Task<RecentOrderAuditReadResult> GetRecentOrdersAsync(
-        DateTimeOffset sinceUtc,
+        DateTimeOffset finalizedSinceUtc,
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -41,7 +63,7 @@ public sealed class EfCorePaperOrderAuditStore(
         {
             await using var db = await dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
             var rows = await db.Orders.AsNoTracking()
-                .Where(o => o.UpdatedAtUtc >= sinceUtc)
+                .Where(o => o.Status == "PENDING_SUBMIT" || o.UpdatedAtUtc >= finalizedSinceUtc)
                 .ToArrayAsync(cancellationToken)
                 .ConfigureAwait(false);
             return new RecentOrderAuditReadResult(true, rows);
@@ -52,85 +74,123 @@ public sealed class EfCorePaperOrderAuditStore(
         }
         catch (Exception ex)
         {
-            log.LogWarning("Failed to read recent local orders for armed cooldown/pending check ({ErrorType}).", ex.GetType().Name);
+            log.LogWarning("Failed to read local orders for armed cooldown/pending check ({ErrorType}).", ex.GetType().Name);
             return new RecentOrderAuditReadResult(false, [], $"Local orders read failed ({ex.GetType().Name}).");
         }
     }
 
-    public async Task<OrderIntentDisposition> TryBeginOrderIntentAsync(
+    public async Task<OrderIntentReservationStatus> TryReserveOrderIntentAsync(
         OrderRow pendingIntentRow,
+        IAlpacaPaperBrokerClient? brokerClient,
+        TimeProvider clock,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(pendingIntentRow);
+        ArgumentNullException.ThrowIfNull(clock);
         cancellationToken.ThrowIfCancellationRequested();
 
         try
         {
             await using var db = await dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+
+            var inserted = await db.Database.ExecuteSqlInterpolatedAsync($"""
+                INSERT INTO orders (
+                    client_order_id, alpaca_order_id, proposal_id, ticker, side, order_type, qty,
+                    limit_price, stop_loss_price, take_profit_price, status, filled_avg_price,
+                    submitted_at_utc, updated_at_utc)
+                VALUES (
+                    {pendingIntentRow.ClientOrderId}, NULL, {pendingIntentRow.ProposalId}, {pendingIntentRow.Ticker},
+                    {pendingIntentRow.Side}, {pendingIntentRow.OrderType}, {pendingIntentRow.Qty},
+                    {pendingIntentRow.LimitPrice}, {pendingIntentRow.StopLossPrice}, {pendingIntentRow.TakeProfitPrice},
+                    'PENDING_SUBMIT', NULL, {pendingIntentRow.SubmittedAtUtc}, {pendingIntentRow.UpdatedAtUtc})
+                ON CONFLICT (client_order_id) DO NOTHING
+                """, cancellationToken).ConfigureAwait(false);
+
+            if (inserted == 1)
+            {
+                return OrderIntentReservationStatus.ReservedForSubmit;
+            }
+
             var existing = await db.Orders.AsNoTracking()
                 .SingleOrDefaultAsync(o => o.ClientOrderId == pendingIntentRow.ClientOrderId, cancellationToken)
                 .ConfigureAwait(false);
 
-            if (existing is not null)
+            if (existing is null)
             {
-                if (string.Equals(existing.Status, "PENDING_SUBMIT", StringComparison.OrdinalIgnoreCase))
-                {
-                    await db.Orders
-                        .Where(o => o.ClientOrderId == pendingIntentRow.ClientOrderId && o.Status == "PENDING_SUBMIT")
-                        .ExecuteUpdateAsync(
-                            setters => setters.SetProperty(o => o.UpdatedAtUtc, pendingIntentRow.UpdatedAtUtc),
-                            cancellationToken)
-                        .ConfigureAwait(false);
-                    return OrderIntentDisposition.ProceedToSubmit;
-                }
-
-                return OrderIntentDisposition.AlreadyFinalizedSkip;
+                return OrderIntentReservationStatus.FailedClosed;
             }
 
-            db.Orders.Add(pendingIntentRow);
-            await db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
-            return OrderIntentDisposition.ProceedToSubmit;
+            if (!string.Equals(existing.Status, "PENDING_SUBMIT", StringComparison.Ordinal))
+            {
+                return OrderIntentReservationStatus.AlreadyFinalizedOrClaimed;
+            }
+
+            var nowUtc = clock.GetUtcNow();
+            if (existing.UpdatedAtUtc > nowUtc - PendingSubmitLeaseDuration || brokerClient is null)
+            {
+                // Active writer lease or no broker lookup client available — never blindly resubmit!
+                return OrderIntentReservationStatus.AlreadyFinalizedOrClaimed;
+            }
+
+            // Fenced CAS claim on expired PENDING_SUBMIT lease.
+            var claimed = await db.Orders
+                .Where(o =>
+                    o.ClientOrderId == existing.ClientOrderId &&
+                    o.Status == "PENDING_SUBMIT" &&
+                    o.UpdatedAtUtc == existing.UpdatedAtUtc)
+                .ExecuteUpdateAsync(
+                    setters => setters.SetProperty(o => o.UpdatedAtUtc, nowUtc),
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            if (claimed != 1)
+            {
+                return OrderIntentReservationStatus.AlreadyFinalizedOrClaimed;
+            }
+
+            var lookup = await brokerClient
+                .GetOrderByClientOrderIdAsync(existing.ClientOrderId, cancellationToken)
+                .ConfigureAwait(false);
+
+            switch (lookup.Outcome)
+            {
+                case BrokerOrderLookupOutcome.Found when lookup.Receipt is not null:
+                {
+                    var reconciledStatus = !string.IsNullOrWhiteSpace(lookup.Receipt.Status)
+                        ? lookup.Receipt.Status.Trim().ToUpperInvariant()
+                        : "SUBMITTED";
+                    var reconciledRow = existing with
+                    {
+                        AlpacaOrderId = lookup.Receipt.OrderId.Trim(),
+                        Status = reconciledStatus,
+                        FilledAvgPrice = lookup.Receipt.FilledAvgPrice,
+                        SubmittedAtUtc = lookup.Receipt.SubmittedAtUtc ?? nowUtc,
+                        UpdatedAtUtc = clock.GetUtcNow()
+                    };
+                    await CompleteOrderIntentAsync(reconciledRow).ConfigureAwait(false);
+                    return OrderIntentReservationStatus.ReconciledExistingReceipt;
+                }
+
+                case BrokerOrderLookupOutcome.NotFound:
+                    // Alpaca definitively confirmed HTTP 404 under our fenced CAS lease: safe for single retry.
+                    return OrderIntentReservationStatus.ReservedForSubmit;
+
+                default:
+                    // Ambiguous lookup error (timeout/5xx/429): keep PENDING_SUBMIT intact and do NOT resubmit.
+                    return OrderIntentReservationStatus.AlreadyFinalizedOrClaimed;
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
         }
-        catch (DbUpdateException)
-        {
-            // Concurrent worker may have inserted the same client_order_id; inspect persisted status fail-closed.
-            try
-            {
-                await using var retryDb = await dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
-                var existing = await retryDb.Orders.AsNoTracking()
-                    .SingleOrDefaultAsync(o => o.ClientOrderId == pendingIntentRow.ClientOrderId, cancellationToken)
-                    .ConfigureAwait(false);
-
-                if (existing is not null && !string.Equals(existing.Status, "PENDING_SUBMIT", StringComparison.OrdinalIgnoreCase))
-                {
-                    return OrderIntentDisposition.AlreadyFinalizedSkip;
-                }
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch
-            {
-                // Fall through to fail-closed below.
-            }
-
-            log.LogWarning(
-                "Write-ahead PENDING_SUBMIT insert conflicted for {ClientOrderId}; failing closed without broker call.",
-                pendingIntentRow.ClientOrderId);
-            return OrderIntentDisposition.FailedClosed;
-        }
         catch (Exception ex)
         {
             log.LogWarning(
-                "Write-ahead PENDING_SUBMIT insert failed for {ClientOrderId} ({ErrorType}); failing closed without broker call.",
+                "Write-ahead PENDING_SUBMIT reservation failed for {ClientOrderId} ({ErrorType}); failing closed without broker call.",
                 pendingIntentRow.ClientOrderId,
                 ex.GetType().Name);
-            return OrderIntentDisposition.FailedClosed;
+            return OrderIntentReservationStatus.FailedClosed;
         }
     }
 
@@ -139,15 +199,16 @@ public sealed class EfCorePaperOrderAuditStore(
         ArgumentNullException.ThrowIfNull(completedRow);
 
         // Intentionally uses CancellationToken.None with a bounded timeout so host shutdown/request cancellation
-        // cannot abort recording an accepted broker order receipt.
+        // cannot abort recording an accepted broker order receipt, and strictly guards WHERE status = 'PENDING_SUBMIT'
+        // so an already-persisted receipt can NEVER be overwritten by a late duplicate/failure completion.
         using var completionCts = new CancellationTokenSource(PostSubmitCompletionTimeout);
         try
         {
             await using var db = await dbFactory.CreateDbContextAsync(completionCts.Token).ConfigureAwait(false);
             db.Database.SetCommandTimeout(PostSubmitCompletionTimeout);
 
-            var updated = await db.Orders
-                .Where(o => o.ClientOrderId == completedRow.ClientOrderId)
+            await db.Orders
+                .Where(o => o.ClientOrderId == completedRow.ClientOrderId && o.Status == "PENDING_SUBMIT")
                 .ExecuteUpdateAsync(setters => setters
                     .SetProperty(o => o.AlpacaOrderId, completedRow.AlpacaOrderId)
                     .SetProperty(o => o.Qty, completedRow.Qty)
@@ -160,12 +221,6 @@ public sealed class EfCorePaperOrderAuditStore(
                     .SetProperty(o => o.UpdatedAtUtc, completedRow.UpdatedAtUtc),
                     completionCts.Token)
                 .ConfigureAwait(false);
-
-            if (updated == 0)
-            {
-                db.Orders.Add(completedRow);
-                await db.SaveChangesAsync(completionCts.Token).ConfigureAwait(false);
-            }
         }
         catch (Exception ex)
         {
