@@ -2,7 +2,7 @@
 
 **SentiX** (`sentimentx.dev`) ist ein 24/7 laufendes, automatisiertes Handelssystem für hochliquide US-Aktien und Sektor-ETFs über die **Alpaca Trading API** (Paper Trading, Long-Only zum Start). Das System wertet Finanznachrichten, Pflichtmitteilungen (SEC EDGAR) und kuratierte Social-Media-Quellen in Echtzeit aus, um **Event-Driven Post-News-Drift** zu handeln und sich täglich am **SPY-Buy-and-Hold-Benchmark** zu messen.
 
-> **Status:** Phase 1 (Bootstrap & Fundament) — strikter **Paper-Trading- & Long-Only-Modus**. Die vollständige technische Spezifikation liegt in [`specs/`](./specs/) und [`AGENTS.md`](./AGENTS.md).
+> **Status:** Phase 4 (Paper Execution & Kill-Switch bereit; Shadow-Modus standardmäßig aktiv) — strikter **Paper-Trading- & Long-Only-Modus** (`https://paper-api.alpaca.markets`, `ALPACA_TRADING_ENABLED=false` als sicherer Default). Die vollständige technische Spezifikation liegt in [`specs/`](./specs/) und [`AGENTS.md`](./AGENTS.md).
 
 ---
 
@@ -69,7 +69,7 @@ SentiX/
 ├── docker-compose.yml     # PostgreSQL 17 + sentix-native + sentix-host
 ├── .env.example           # Vorlage für API-Keys & Secrets
 ├── config/universe.json   # Watchlist, Sektor-ETFs & Social-Allowlist
-├── specs/                 # Technische Verträge (001–005)
+├── specs/                 # Technische Verträge (001–008)
 ├── src/
 │   ├── native/            # C++20/23 Fast-Path Daemon + GoogleTest
 │   ├── dotnet/            # Domain, Ingestion, NativeBridge, DecisionSwarm, Risk, Execution, Infra, Host
@@ -104,11 +104,35 @@ docker compose up -d --build
 
 ---
 
+## Dashboard-Zugriff über SSH-Tunnel (http://localhost:18080/)
+
+`sentix-host` exponiert das Cockpit niemals öffentlich im Internet: Der Container bindet auf dem Linux-Server strikt an `127.0.0.1:8080`, und `UFW` blockiert jeden externen Zugriff auf Port `8080` (lediglich `22/tcp` für SSH mit Ed25519-Schlüssel ist geöffnet).
+
+1. **Lokale SSH-Konfiguration (`~/.ssh/config`):**
+   ```sshconfig
+   Host sentix-us
+       HostName <SERVER_IP>
+       User sentix
+       IdentityFile ~/.ssh/id_ed25519
+       LocalForward 18080 127.0.0.1:8080
+   ```
+2. **Tunnel starten:**
+   ```bash
+   ssh -N sentix-us
+   ```
+3. **Ablauf beim Öffnen von `http://localhost:18080/` im Browser (4 Schritte):**
+   1. **Browser → `127.0.0.1:18080`:** Der lokale Browser sendet HTTP-Anfragen (inkl. `X-SentiX-Confirm` & Loopback-`Origin` bei Kill-Switch-Aktionen) ausschließlich an den lokalen Port `18080`.
+   2. **`127.0.0.1:18080` → lokaler SSH-Client:** Der laufende `ssh -N sentix-us`-Prozess nimmt die Verbindung lokal entgegen.
+   3. **Lokaler SSH-Client → verschlüsselter Port-22-Tunnel:** Der Datenstrom wird Ed25519-authentifiziert und Ende-zu-Ende-verschlüsselt über Port `22/tcp` an `sentix-us` übertragen.
+   4. **`127.0.0.1:8080` auf `sentix-us` → `sentix-host`:** Der SSH-Daemon auf dem Server leitet die Anfrage intern über Loopback (`127.0.0.1:8080`) direkt an den `sentix-host`-Container weiter.
+
+---
+
 ## Phasenplan & Workflow
 
-- **Phase 1 (Aktuell):** Bootstrap, CI, PostgreSQL-Schema, C++ IPC-Daemon (HTML-Stripping + Mock-Scorer), Hard-Risk-Manager (100 % Coverage, Long-Only), NativeBridge & Alpaca News Collector (0 Trades).
-- **Phase 2:** Lokales ONNX-FinBERT (`INT8`), SEC-EDGAR- & X-Filtered-Stream-Adapter, Earnings-/Makro-Kalender-Sync (`scheduled_events`).
-- **Phase 3:** Decision-Swarm-Orchestrierung, Debatten-Persistenz & React-Dashboard im Shadow-Mode.
-- **Phase 4:** Alpaca Paper Execution (Bracket-Orders), UI-Kill-Switch und 4–8 Wochen Live-Paper-Test gegen SPY.
+- **Phase 1 (Abgeschlossen):** Bootstrap, CI, PostgreSQL-Schema, C++ IPC-Daemon (HTML-Stripping + Mock-Scorer), Hard-Risk-Manager (100 % Coverage, Long-Only), NativeBridge & Alpaca News Collector.
+- **Phase 2 (Abgeschlossen):** Lokales ONNX-FinBERT (`INT8`), SEC-EDGAR- & X-Filtered-Stream-Adapter, Earnings-/Makro-Kalender-Sync (`scheduled_events`).
+- **Phase 3 (Abgeschlossen):** Decision-Swarm-Orchestrierung, Debatten-Persistenz & React-Dashboard im Shadow-Mode.
+- **Phase 4 (Aktuell — Paper Execution & Kill-Switch bereit; Shadow-Modus standardmäßig aktiv):** Alpaca Paper Execution (Bracket-Orders auf `paper-api.alpaca.markets`), persistenter PostgreSQL-Kill-Switch, Orders-Audit-Cockpit und 4–8 Wochen Live-Paper-Test gegen SPY.
 
 **Git-Workflow:** Dieses Repository arbeitet strikt ohne GitHub Pull Requests (**No-PR-Policy**). Parallele Feature-Branches werden lokal geprüft, per `git merge --no-ff` in `main` integriert und direkt gepusht. Details siehe [`AGENTS.md`](./AGENTS.md).

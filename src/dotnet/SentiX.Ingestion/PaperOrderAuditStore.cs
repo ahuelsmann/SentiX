@@ -22,6 +22,15 @@ public sealed record RecentOrderAuditReadResult(
 public interface IPaperOrderAuditStore
 {
     /// <summary>
+    /// Reconciles all expired (<c>&gt;= 60s</c>) <c>PENDING_SUBMIT</c> order rows under a fenced CAS claim via
+    /// <see cref="IAlpacaPaperBrokerClient.GetOrderByClientOrderIdAsync"/> before armed risk evaluation runs.
+    /// </summary>
+    Task ReconcileExpiredPendingOrdersAsync(
+        IAlpacaPaperBrokerClient? brokerClient,
+        TimeProvider clock,
+        CancellationToken cancellationToken);
+
+    /// <summary>
     /// Returns ALL unresolved <c>PENDING_SUBMIT</c> intents regardless of age, plus finalized orders
     /// updated on or after <paramref name="finalizedSinceUtc"/> for ticker cooldown checks.
     /// </summary>
@@ -53,6 +62,48 @@ public sealed class EfCorePaperOrderAuditStore(
 
     private readonly IDbContextFactory<SentiXDbContext> dbFactory = dbFactory ?? throw new ArgumentNullException(nameof(dbFactory));
     private readonly ILogger log = logger ?? NullLogger.Instance;
+
+    public async Task ReconcileExpiredPendingOrdersAsync(
+        IAlpacaPaperBrokerClient? brokerClient,
+        TimeProvider clock,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(clock);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (brokerClient is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var cutoffUtc = clock.GetUtcNow() - PendingSubmitLeaseDuration;
+            OrderRow[] expiredRows;
+            await using (var db = await dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false))
+            {
+                expiredRows = await db.Orders.AsNoTracking()
+                    .Where(o => o.Status == "PENDING_SUBMIT" && o.UpdatedAtUtc <= cutoffUtc)
+                    .OrderBy(o => o.UpdatedAtUtc)
+                    .Take(50)
+                    .ToArrayAsync(cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            foreach (var expired in expiredRows)
+            {
+                await TryClaimAndReconcileExpiredRowAsync(expired, brokerClient, clock, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            log.LogWarning("Pre-evaluation PENDING_SUBMIT reconciliation encountered an error ({ErrorType}); leaving pending intents fail-closed.", ex.GetType().Name);
+        }
+    }
 
     public async Task<RecentOrderAuditReadResult> GetRecentOrdersAsync(
         DateTimeOffset finalizedSinceUtc,
@@ -91,29 +142,31 @@ public sealed class EfCorePaperOrderAuditStore(
 
         try
         {
-            await using var db = await dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
-
-            var inserted = await db.Database.ExecuteSqlInterpolatedAsync($"""
-                INSERT INTO orders (
-                    client_order_id, alpaca_order_id, proposal_id, ticker, side, order_type, qty,
-                    limit_price, stop_loss_price, take_profit_price, status, filled_avg_price,
-                    submitted_at_utc, updated_at_utc)
-                VALUES (
-                    {pendingIntentRow.ClientOrderId}, NULL, {pendingIntentRow.ProposalId}, {pendingIntentRow.Ticker},
-                    {pendingIntentRow.Side}, {pendingIntentRow.OrderType}, {pendingIntentRow.Qty},
-                    {pendingIntentRow.LimitPrice}, {pendingIntentRow.StopLossPrice}, {pendingIntentRow.TakeProfitPrice},
-                    'PENDING_SUBMIT', NULL, {pendingIntentRow.SubmittedAtUtc}, {pendingIntentRow.UpdatedAtUtc})
-                ON CONFLICT (client_order_id) DO NOTHING
-                """, cancellationToken).ConfigureAwait(false);
-
-            if (inserted == 1)
+            OrderRow? existing;
+            await using (var db = await dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false))
             {
-                return OrderIntentReservationStatus.ReservedForSubmit;
-            }
+                var inserted = await db.Database.ExecuteSqlInterpolatedAsync($"""
+                    INSERT INTO orders (
+                        client_order_id, alpaca_order_id, proposal_id, ticker, side, order_type, qty,
+                        limit_price, stop_loss_price, take_profit_price, status, filled_avg_price,
+                        submitted_at_utc, updated_at_utc)
+                    VALUES (
+                        {pendingIntentRow.ClientOrderId}, NULL, {pendingIntentRow.ProposalId}, {pendingIntentRow.Ticker},
+                        {pendingIntentRow.Side}, {pendingIntentRow.OrderType}, {pendingIntentRow.Qty},
+                        {pendingIntentRow.LimitPrice}, {pendingIntentRow.StopLossPrice}, {pendingIntentRow.TakeProfitPrice},
+                        'PENDING_SUBMIT', NULL, {pendingIntentRow.SubmittedAtUtc}, {pendingIntentRow.UpdatedAtUtc})
+                    ON CONFLICT (client_order_id) DO NOTHING
+                    """, cancellationToken).ConfigureAwait(false);
 
-            var existing = await db.Orders.AsNoTracking()
-                .SingleOrDefaultAsync(o => o.ClientOrderId == pendingIntentRow.ClientOrderId, cancellationToken)
-                .ConfigureAwait(false);
+                if (inserted == 1)
+                {
+                    return OrderIntentReservationStatus.ReservedForSubmit;
+                }
+
+                existing = await db.Orders.AsNoTracking()
+                    .SingleOrDefaultAsync(o => o.ClientOrderId == pendingIntentRow.ClientOrderId, cancellationToken)
+                    .ConfigureAwait(false);
+            }
 
             if (existing is null)
             {
@@ -128,57 +181,13 @@ public sealed class EfCorePaperOrderAuditStore(
             var nowUtc = clock.GetUtcNow();
             if (existing.UpdatedAtUtc > nowUtc - PendingSubmitLeaseDuration || brokerClient is null)
             {
-                // Active writer lease or no broker lookup client available — never blindly resubmit!
                 return OrderIntentReservationStatus.AlreadyFinalizedOrClaimed;
             }
 
-            // Fenced CAS claim on expired PENDING_SUBMIT lease.
-            var claimed = await db.Orders
-                .Where(o =>
-                    o.ClientOrderId == existing.ClientOrderId &&
-                    o.Status == "PENDING_SUBMIT" &&
-                    o.UpdatedAtUtc == existing.UpdatedAtUtc)
-                .ExecuteUpdateAsync(
-                    setters => setters.SetProperty(o => o.UpdatedAtUtc, nowUtc),
-                    cancellationToken)
-                .ConfigureAwait(false);
-
-            if (claimed != 1)
-            {
-                return OrderIntentReservationStatus.AlreadyFinalizedOrClaimed;
-            }
-
-            var lookup = await brokerClient
-                .GetOrderByClientOrderIdAsync(existing.ClientOrderId, cancellationToken)
-                .ConfigureAwait(false);
-
-            switch (lookup.Outcome)
-            {
-                case BrokerOrderLookupOutcome.Found when lookup.Receipt is not null:
-                {
-                    var reconciledStatus = !string.IsNullOrWhiteSpace(lookup.Receipt.Status)
-                        ? lookup.Receipt.Status.Trim().ToUpperInvariant()
-                        : "SUBMITTED";
-                    var reconciledRow = existing with
-                    {
-                        AlpacaOrderId = lookup.Receipt.OrderId.Trim(),
-                        Status = reconciledStatus,
-                        FilledAvgPrice = lookup.Receipt.FilledAvgPrice,
-                        SubmittedAtUtc = lookup.Receipt.SubmittedAtUtc ?? nowUtc,
-                        UpdatedAtUtc = clock.GetUtcNow()
-                    };
-                    await CompleteOrderIntentAsync(reconciledRow).ConfigureAwait(false);
-                    return OrderIntentReservationStatus.ReconciledExistingReceipt;
-                }
-
-                case BrokerOrderLookupOutcome.NotFound:
-                    // Alpaca definitively confirmed HTTP 404 under our fenced CAS lease: safe for single retry.
-                    return OrderIntentReservationStatus.ReservedForSubmit;
-
-                default:
-                    // Ambiguous lookup error (timeout/5xx/429): keep PENDING_SUBMIT intact and do NOT resubmit.
-                    return OrderIntentReservationStatus.AlreadyFinalizedOrClaimed;
-            }
+            var reconciled = await TryClaimAndReconcileExpiredRowAsync(existing, brokerClient, clock, cancellationToken).ConfigureAwait(false);
+            return reconciled == BrokerOrderLookupOutcome.Found
+                ? OrderIntentReservationStatus.ReconciledExistingReceipt
+                : OrderIntentReservationStatus.AlreadyFinalizedOrClaimed;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -231,6 +240,69 @@ public sealed class EfCorePaperOrderAuditStore(
                 completedRow.Status,
                 completedRow.AlpacaOrderId ?? "none",
                 ex.GetType().Name);
+        }
+    }
+
+    private async Task<BrokerOrderLookupOutcome> TryClaimAndReconcileExpiredRowAsync(
+        OrderRow expired,
+        IAlpacaPaperBrokerClient brokerClient,
+        TimeProvider clock,
+        CancellationToken cancellationToken)
+    {
+        var claimNow = clock.GetUtcNow();
+        await using (var claimDb = await dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false))
+        {
+            var claimed = await claimDb.Orders
+                .Where(o =>
+                    o.ClientOrderId == expired.ClientOrderId &&
+                    o.Status == "PENDING_SUBMIT" &&
+                    o.UpdatedAtUtc == expired.UpdatedAtUtc)
+                .ExecuteUpdateAsync(
+                    setters => setters.SetProperty(o => o.UpdatedAtUtc, claimNow),
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            if (claimed != 1)
+            {
+                return BrokerOrderLookupOutcome.AmbiguousFailure;
+            }
+        }
+
+        var lookup = await brokerClient
+            .GetOrderByClientOrderIdAsync(expired.ClientOrderId, cancellationToken)
+            .ConfigureAwait(false);
+
+        switch (lookup.Outcome)
+        {
+            case BrokerOrderLookupOutcome.Found when lookup.Receipt is not null:
+            {
+                var reconciledStatus = !string.IsNullOrWhiteSpace(lookup.Receipt.Status)
+                    ? lookup.Receipt.Status.Trim().ToUpperInvariant()
+                    : "SUBMITTED";
+                await CompleteOrderIntentAsync(expired with
+                {
+                    AlpacaOrderId = lookup.Receipt.OrderId.Trim(),
+                    Status = reconciledStatus,
+                    FilledAvgPrice = lookup.Receipt.FilledAvgPrice,
+                    SubmittedAtUtc = lookup.Receipt.SubmittedAtUtc ?? claimNow,
+                    UpdatedAtUtc = clock.GetUtcNow()
+                }).ConfigureAwait(false);
+                return BrokerOrderLookupOutcome.Found;
+            }
+
+            case BrokerOrderLookupOutcome.NotFound:
+                // Definitively never received by Alpaca (HTTP 404): clear stale reservation without blind resubmission.
+                await CompleteOrderIntentAsync(expired with
+                {
+                    AlpacaOrderId = null,
+                    Status = "FAILED_BROKER",
+                    UpdatedAtUtc = clock.GetUtcNow()
+                }).ConfigureAwait(false);
+                return BrokerOrderLookupOutcome.NotFound;
+
+            default:
+                // Ambiguous lookup error: leave PENDING_SUBMIT intact fail-closed.
+                return BrokerOrderLookupOutcome.AmbiguousFailure;
         }
     }
 }

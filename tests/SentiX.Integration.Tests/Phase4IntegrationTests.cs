@@ -292,6 +292,218 @@ public sealed class Phase4IntegrationTests
         Assert.False(dailyLossDecision.Approved);
         Assert.Equal(RiskTradingState.HaltedDailyLoss, dailyLossDecision.EffectiveTradingState);
         Assert.Contains(dailyLossDecision.Violations, v => v.Code == SentiX.Risk.RiskViolationCode.DailyLossLimitReached);
+
+        // (c5 / #315 H1) Held AAPL ($12k) + open pending AAPL buy ($10k) + candidate MSFT (TECH) buy ($5k on $100k equity -> $27k > 25% TECH cap)
+        // MUST sum pending BUY notional onto the already-held AAPL OpenPosition and reject MSFT with 0 broker submissions!
+        quotes.Update(new MarketQuoteSnapshot("MSFT", 249.90m, 250.00m, 249.95m, 4.0, FixedRegularMarketUtc));
+        var msftProposal = new TradeProposal(
+            "prop_msft_h1", "evt_msft_h1", TradeAction.Buy, "MSFT", InstrumentType.Equity,
+            0.92, 24, 0.03m, 0.06m, "MSFT catalyst", "None");
+        var heldPlusPendingSnapshot = new PaperAccountSnapshot(
+            Equity: 100_000m,
+            LastEquity: 100_000m,
+            BuyingPower: 100_000m,
+            DailyPnLPct: 0.0,
+            OpenPositions: [new SentiX.Risk.OpenPosition("AAPL", "TECH", 60, 12_000m, 200m)],
+            PendingOrders: [new SentiX.Risk.PendingOrder("SX-20260604-AAPL-BUY-open0001", "AAPL", SentiX.Risk.TradeAction.Buy, 50)],
+            FetchedAtUtc: FixedRegularMarketUtc,
+            PendingOrderLimitPrices: new Dictionary<string, decimal?> { ["SX-20260604-AAPL-BUY-open0001"] = 200m });
+
+        var heldPlusPendingAudit = new InMemoryOrderAuditStore();
+        var zeroBrokerSubmissions = 0;
+        var neverCalledEngine = new StubPaperExecutionEngine(_ =>
+        {
+            zeroBrokerSubmissions++;
+            throw new InvalidOperationException("Must not submit broker order when TECH sector cap is exceeded.");
+        });
+        using (var h1Pipeline = new MarketEventPipeline(
+            new ThrowingContextFactory(),
+            new NativeBridgeClient(Path.Combine(Path.GetTempPath(), $"sx-h1-{Guid.NewGuid():N}.sock")),
+            NullLogger<MarketEventPipeline>.Instance,
+            isConfigured: true,
+            quoteCache: quotes,
+            universe: universe,
+            timeProvider: new FixedClock(FixedRegularMarketUtc),
+            paperExecution: neverCalledEngine,
+            paperOptions: new AlpacaPaperOptions { TradingEnabled = true },
+            paperPortfolioProvider: new StubPaperPortfolioProvider(_ => PaperAccountSnapshotResult.Success(heldPlusPendingSnapshot)),
+            orderAuditStore: heldPlusPendingAudit))
+        {
+            RiskEvaluationRow? savedRisk = null;
+            await h1Pipeline.ExecuteArmedEvaluationAndOrderAsync(
+                msftProposal,
+                "MSFT",
+                FixedRegularMarketUtc,
+                _ => Task.FromResult<string?>("ACTIVE"),
+                (row, _) => { savedRisk = row; return Task.CompletedTask; },
+                CancellationToken.None);
+
+            Assert.NotNull(savedRisk);
+            Assert.False(savedRisk!.Approved);
+            Assert.Contains("SectorExposureExceeded", savedRisk.Violations, StringComparison.Ordinal);
+            Assert.Equal(0, zeroBrokerSubmissions);
+        }
+
+        // (c6 / #315 H1) Unpriceable or unknown-ticker pending BUY order MUST fail closed (SnapshotAvailable == false)
+        var unpriceablePendingSnapshot = cleanAccount with
+        {
+            PendingOrders = [new SentiX.Risk.PendingOrder("SX-20260604-NVDA-BUY-noprice", "NVDA", SentiX.Risk.TradeAction.Buy, 10)],
+            PendingOrderLimitPrices = new Dictionary<string, decimal?> { ["SX-20260604-NVDA-BUY-noprice"] = null } // NVDA has no quote in quoteCache
+        };
+        var unpriceableEval = MarketEventPipeline.TryEvaluateArmedHardRiskFromSnapshots(
+            msftProposal, "MSFT", quotes, universe, RiskTradingState.Active, unpriceablePendingSnapshot, [], FixedRegularMarketUtc);
+        Assert.False(unpriceableEval.SnapshotAvailable);
+
+        var unknownTickerPendingSnapshot = cleanAccount with
+        {
+            PendingOrders = [new SentiX.Risk.PendingOrder("SX-20260604-ZZZZ-BUY-unknown", "ZZZZ", SentiX.Risk.TradeAction.Buy, 10)],
+            PendingOrderLimitPrices = new Dictionary<string, decimal?> { ["SX-20260604-ZZZZ-BUY-unknown"] = 50m }
+        };
+        var unknownTickerEval = MarketEventPipeline.TryEvaluateArmedHardRiskFromSnapshots(
+            msftProposal, "MSFT", quotes, universe, RiskTradingState.Active, unknownTickerPendingSnapshot, [], FixedRegularMarketUtc);
+        Assert.False(unknownTickerEval.SnapshotAvailable);
+    }
+
+    [Fact]
+    public async Task ProcessAsync_UncertainPostTimeoutKeepsPendingSubmit_AndNextProposalReconcilesReceiptWithoutDuplicatePost()
+    {
+        var universe = UniverseConfigLoader.Load(UniverseAndXTests.UniversePath);
+        var clock = new AdvanceableClock(FixedRegularMarketUtc);
+        var quotes = new InMemoryMarketQuoteCache();
+        quotes.Update(new MarketQuoteSnapshot("AAPL", 199.90m, 200.00m, 199.95m, 5.0, FixedRegularMarketUtc));
+        quotes.Update(new MarketQuoteSnapshot("JPM", 199.90m, 200.00m, 199.95m, 5.0, FixedRegularMarketUtc));
+
+        await using var nativeServer = await StubUnixNativeServer.StartAsync();
+        using var nativeClient = new NativeBridgeClient(nativeServer.SocketPath, timeProvider: clock);
+
+        var postOrderCount = 0;
+        var getLookupCount = 0;
+        string? timedOutClientOrderId = null;
+
+        var options = new AlpacaPaperOptions
+        {
+            TradingEnabled = true,
+            PaperMode = true,
+            AllowShorting = false,
+            BaseUrl = AlpacaPaperOptions.DefaultPaperBaseUrl,
+            ApiKey = "PK_TEST_E2E_TIMEOUT_RECONCILE",
+            SecretKey = "SK_TEST_E2E_TIMEOUT_RECONCILE",
+            RequestTimeout = TimeSpan.FromSeconds(5)
+        };
+
+        var brokerHttpHandler = new StubAlpacaHttpHandler(req =>
+        {
+            if (req.Method == HttpMethod.Post && req.RequestUri!.AbsolutePath == "/v2/orders")
+            {
+                var callNum = Interlocked.Increment(ref postOrderCount);
+                var body = req.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+                using var doc = JsonDocument.Parse(body);
+                var cid = doc.RootElement.GetProperty("client_order_id").GetString()!;
+                var sym = doc.RootElement.GetProperty("symbol").GetString()!;
+
+                if (callNum == 1)
+                {
+                    // Proposal 1 suffers an uncertain transport timeout AFTER Alpaca actually accepted it!
+                    timedOutClientOrderId = cid;
+                    throw new TimeoutException("Simulated uncertain POST /v2/orders timeout.");
+                }
+
+                // Proposal 2 (JPM) succeeds normally
+                return JsonHttpResponse(HttpStatusCode.OK, $$$"""
+                    {"id":"alp-jpm-2","client_order_id":"{{{cid}}}","symbol":"{{{sym}}}","qty":"25","side":"buy","type":"limit","order_class":"bracket","limit_price":"200.00","status":"accepted","submitted_at":"2026-06-04T15:01:05Z","created_at":"2026-06-04T15:01:05Z"}
+                    """);
+            }
+
+            if (req.Method == HttpMethod.Get && req.RequestUri!.AbsolutePath == "/v2/orders:by_client_order_id")
+            {
+                Interlocked.Increment(ref getLookupCount);
+                Assert.NotNull(timedOutClientOrderId);
+                Assert.Contains(Uri.EscapeDataString(timedOutClientOrderId!), req.RequestUri.Query, StringComparison.Ordinal);
+                return JsonHttpResponse(HttpStatusCode.OK, $$$"""
+                    {"id":"alp-aapl-recovered-1","client_order_id":"{{{timedOutClientOrderId}}}","symbol":"AAPL","qty":"25","side":"buy","type":"limit","order_class":"bracket","limit_price":"200.00","status":"accepted","submitted_at":"2026-06-04T15:00:00Z","created_at":"2026-06-04T15:00:00Z"}
+                    """);
+            }
+
+            if (req.Method == HttpMethod.Get && req.RequestUri!.AbsolutePath == "/v2/account")
+            {
+                return JsonHttpResponse(HttpStatusCode.OK, """
+                    {"equity":"100000.00","last_equity":"100000.00","buying_power":"95000.00","trading_blocked":false,"account_blocked":false}
+                    """);
+            }
+
+            if (req.Method == HttpMethod.Get && req.RequestUri!.AbsolutePath == "/v2/positions")
+            {
+                return JsonHttpResponse(HttpStatusCode.OK, "[]");
+            }
+
+            if (req.Method == HttpMethod.Get && req.RequestUri!.PathAndQuery == "/v2/orders?status=open&limit=500")
+            {
+                var openJson = timedOutClientOrderId is null
+                    ? "[]"
+                    : $$$"""[{"id":"alp-aapl-recovered-1","client_order_id":"{{{timedOutClientOrderId}}}","symbol":"AAPL","side":"buy","qty":"25","limit_price":"200.00"}]""";
+                return JsonHttpResponse(HttpStatusCode.OK, openJson);
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        });
+
+        using var httpClient = new HttpClient(brokerHttpHandler);
+        var brokerClient = new AlpacaPaperBrokerClient(httpClient, options, timeProvider: clock);
+        var portfolioProvider = new AlpacaPaperPortfolioSnapshotProvider(httpClient, options, timeProvider: clock);
+        var executionEngine = new PaperExecutionEngine(
+            options,
+            new StaticTradingStateProvider(RiskTradingState.Active),
+            brokerClient,
+            clock);
+
+        var proposalQueue = new Queue<TradeProposal>([
+            new TradeProposal("prop_timeout_1", "evt_timeout_1", TradeAction.Buy, "AAPL", InstrumentType.Equity, 0.90, 24, 0.03m, 0.06m, "AAPL 8-K", "None"),
+            new TradeProposal("prop_next_2", "evt_next_2", TradeAction.Buy, "JPM", InstrumentType.Equity, 0.90, 24, 0.03m, 0.06m, "JPM 8-K", "None")
+        ]);
+        var queuedSwarm = new QueueDecisionSwarm(proposalQueue);
+        var auditStore = new InMemoryOrderAuditStore();
+        var pipelinePersistence = new InMemoryPipelinePersistence();
+
+        using var pipeline = new MarketEventPipeline(
+            new ThrowingContextFactory(),
+            nativeClient,
+            NullLogger<MarketEventPipeline>.Instance,
+            isConfigured: true,
+            queuedSwarm,
+            quotes,
+            universe,
+            clock,
+            executionEngine,
+            options,
+            portfolioProvider,
+            auditStore,
+            brokerClient,
+            pipelinePersistence);
+
+        // 1. Run Proposal 1 through full MarketEventPipeline.ProcessAsync -> POST /v2/orders times out -> MUST remain PENDING_SUBMIT!
+        var event1 = new MarketEvent("evt_timeout_1", EventSource.SecEdgar, "SEC", clock.GetUtcNow(), "AAPL 8-K", "Sum", "Body", ["AAPL"]);
+        await pipeline.ProcessAsync(event1, """{"id":1}""", CancellationToken.None);
+
+        Assert.Equal(1, postOrderCount);
+        Assert.Equal(0, getLookupCount);
+        Assert.NotNull(timedOutClientOrderId);
+        Assert.Equal("PENDING_SUBMIT", auditStore.Rows[timedOutClientOrderId!].Status);
+
+        // 2. Advance clock > 60s lease and run Proposal 2 (JPM) through full MarketEventPipeline.ProcessAsync:
+        // Pre-risk reconciliation MUST resolve Proposal 1 via GET /v2/orders:by_client_order_id (200) -> ACCEPTED
+        // without issuing a duplicate POST /v2/orders for Proposal 1, then submit Proposal 2 cleanly!
+        clock.Advance(TimeSpan.FromSeconds(65));
+        quotes.Update(new MarketQuoteSnapshot("JPM", 199.90m, 200.00m, 199.95m, 5.0, clock.GetUtcNow()));
+
+        var event2 = new MarketEvent("evt_next_2", EventSource.SecEdgar, "SEC", clock.GetUtcNow(), "JPM 8-K", "Sum", "Body", ["JPM"]);
+        await pipeline.ProcessAsync(event2, """{"id":2}""", CancellationToken.None);
+
+        Assert.Equal(1, getLookupCount);
+        Assert.Equal(2, postOrderCount); // Exactly 1 POST for AAPL + 1 POST for JPM (ZERO duplicate POSTs for AAPL!)
+        Assert.Equal("ACCEPTED", auditStore.Rows[timedOutClientOrderId!].Status);
+        Assert.Equal("alp-aapl-recovered-1", auditStore.Rows[timedOutClientOrderId!].AlpacaOrderId);
+        Assert.Equal(2, auditStore.Rows.Count);
+        Assert.All(auditStore.Rows.Values, r => Assert.Equal("ACCEPTED", r.Status));
     }
 
     [Fact]
@@ -998,6 +1210,32 @@ public sealed class Phase4IntegrationTests
         public bool FailBegin { get; set; }
         public bool FailComplete { get; set; }
 
+        public async Task ReconcileExpiredPendingOrdersAsync(
+            IAlpacaPaperBrokerClient? brokerClient,
+            TimeProvider clock,
+            CancellationToken cancellationToken)
+        {
+            if (brokerClient is null)
+            {
+                return;
+            }
+
+            OrderRow[] expired;
+            var cutoff = clock.GetUtcNow() - EfCorePaperOrderAuditStore.PendingSubmitLeaseDuration;
+            lock (gate)
+            {
+                expired = Rows.Values
+                    .Where(r => r.Status == "PENDING_SUBMIT" && r.UpdatedAtUtc <= cutoff)
+                    .OrderBy(r => r.UpdatedAtUtc)
+                    .ToArray();
+            }
+
+            foreach (var row in expired)
+            {
+                await TryClaimAndReconcileAsync(row, brokerClient, clock, cancellationToken);
+            }
+        }
+
         public Task<RecentOrderAuditReadResult> GetRecentOrdersAsync(DateTimeOffset finalizedSinceUtc, CancellationToken cancellationToken)
         {
             lock (gate)
@@ -1015,7 +1253,7 @@ public sealed class Phase4IntegrationTests
             TimeProvider clock,
             CancellationToken cancellationToken)
         {
-            OrderRow? expiredToReconcile = null;
+            OrderRow? existingSnapshot;
             var nowUtc = clock.GetUtcNow();
 
             lock (gate)
@@ -1025,44 +1263,26 @@ public sealed class Phase4IntegrationTests
                     return OrderIntentReservationStatus.FailedClosed;
                 }
 
-                if (!Rows.TryGetValue(pendingIntentRow.ClientOrderId, out var existing))
+                if (!Rows.TryGetValue(pendingIntentRow.ClientOrderId, out existingSnapshot))
                 {
                     Rows[pendingIntentRow.ClientOrderId] = pendingIntentRow;
                     return OrderIntentReservationStatus.ReservedForSubmit;
                 }
-
-                if (!string.Equals(existing.Status, "PENDING_SUBMIT", StringComparison.Ordinal))
-                {
-                    return OrderIntentReservationStatus.AlreadyFinalizedOrClaimed;
-                }
-
-                if (existing.UpdatedAtUtc > nowUtc - EfCorePaperOrderAuditStore.PendingSubmitLeaseDuration || brokerClient is null)
-                {
-                    return OrderIntentReservationStatus.AlreadyFinalizedOrClaimed;
-                }
-
-                // Fenced CAS claim on expired PENDING_SUBMIT lease
-                var claimed = existing with { UpdatedAtUtc = nowUtc };
-                Rows[pendingIntentRow.ClientOrderId] = claimed;
-                expiredToReconcile = claimed;
             }
 
-            var lookup = await brokerClient!.GetOrderByClientOrderIdAsync(expiredToReconcile.ClientOrderId, cancellationToken);
-            if (lookup.Outcome == BrokerOrderLookupOutcome.Found && lookup.Receipt is not null)
+            if (!string.Equals(existingSnapshot.Status, "PENDING_SUBMIT", StringComparison.Ordinal))
             {
-                await CompleteOrderIntentAsync(expiredToReconcile with
-                {
-                    AlpacaOrderId = lookup.Receipt.OrderId.Trim(),
-                    Status = lookup.Receipt.Status.Trim().ToUpperInvariant(),
-                    FilledAvgPrice = lookup.Receipt.FilledAvgPrice,
-                    SubmittedAtUtc = lookup.Receipt.SubmittedAtUtc ?? nowUtc,
-                    UpdatedAtUtc = clock.GetUtcNow()
-                });
-                return OrderIntentReservationStatus.ReconciledExistingReceipt;
+                return OrderIntentReservationStatus.AlreadyFinalizedOrClaimed;
             }
 
-            return lookup.Outcome == BrokerOrderLookupOutcome.NotFound
-                ? OrderIntentReservationStatus.ReservedForSubmit
+            if (existingSnapshot.UpdatedAtUtc > nowUtc - EfCorePaperOrderAuditStore.PendingSubmitLeaseDuration || brokerClient is null)
+            {
+                return OrderIntentReservationStatus.AlreadyFinalizedOrClaimed;
+            }
+
+            var outcome = await TryClaimAndReconcileAsync(existingSnapshot, brokerClient, clock, cancellationToken);
+            return outcome == BrokerOrderLookupOutcome.Found
+                ? OrderIntentReservationStatus.ReconciledExistingReceipt
                 : OrderIntentReservationStatus.AlreadyFinalizedOrClaimed;
         }
 
@@ -1078,6 +1298,115 @@ public sealed class Phase4IntegrationTests
                 }
             }
 
+            return Task.CompletedTask;
+        }
+
+        private async Task<BrokerOrderLookupOutcome> TryClaimAndReconcileAsync(
+            OrderRow expectedRow,
+            IAlpacaPaperBrokerClient brokerClient,
+            TimeProvider clock,
+            CancellationToken cancellationToken)
+        {
+            var claimNow = clock.GetUtcNow();
+            OrderRow claimedRow;
+            lock (gate)
+            {
+                if (!Rows.TryGetValue(expectedRow.ClientOrderId, out var current) ||
+                    !string.Equals(current.Status, "PENDING_SUBMIT", StringComparison.Ordinal) ||
+                    current.UpdatedAtUtc != expectedRow.UpdatedAtUtc)
+                {
+                    return BrokerOrderLookupOutcome.AmbiguousFailure;
+                }
+
+                claimedRow = current with { UpdatedAtUtc = claimNow };
+                Rows[expectedRow.ClientOrderId] = claimedRow;
+            }
+
+            var lookup = await brokerClient.GetOrderByClientOrderIdAsync(claimedRow.ClientOrderId, cancellationToken);
+            if (lookup.Outcome == BrokerOrderLookupOutcome.Found && lookup.Receipt is not null)
+            {
+                await CompleteOrderIntentAsync(claimedRow with
+                {
+                    AlpacaOrderId = lookup.Receipt.OrderId.Trim(),
+                    Status = lookup.Receipt.Status.Trim().ToUpperInvariant(),
+                    FilledAvgPrice = lookup.Receipt.FilledAvgPrice,
+                    SubmittedAtUtc = lookup.Receipt.SubmittedAtUtc ?? claimNow,
+                    UpdatedAtUtc = clock.GetUtcNow()
+                });
+                return BrokerOrderLookupOutcome.Found;
+            }
+
+            if (lookup.Outcome == BrokerOrderLookupOutcome.NotFound)
+            {
+                await CompleteOrderIntentAsync(claimedRow with
+                {
+                    AlpacaOrderId = null,
+                    Status = "FAILED_BROKER",
+                    UpdatedAtUtc = clock.GetUtcNow()
+                });
+                return BrokerOrderLookupOutcome.NotFound;
+            }
+
+            return BrokerOrderLookupOutcome.AmbiguousFailure;
+        }
+    }
+
+    private static HttpResponseMessage JsonHttpResponse(HttpStatusCode status, string json) =>
+        new(status) { Content = new StringContent(json, Encoding.UTF8, "application/json") };
+
+    private sealed class AdvanceableClock(DateTimeOffset initialUtc) : TimeProvider
+    {
+        private long ticks = initialUtc.UtcTicks;
+        public override DateTimeOffset GetUtcNow() => new(Interlocked.Read(ref ticks), TimeSpan.Zero);
+        public void Advance(TimeSpan delta) => Interlocked.Add(ref ticks, delta.Ticks);
+    }
+
+    private sealed class StubAlpacaHttpHandler(Func<HttpRequestMessage, HttpResponseMessage> responder) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+            Task.FromResult(responder(request));
+    }
+
+    private sealed class QueueDecisionSwarm(Queue<TradeProposal> proposals) : IDecisionSwarmOrchestrator
+    {
+        public Task<DecisionDebateOutcome> EvaluateAsync(DecisionDebateRequest request, CancellationToken cancellationToken)
+        {
+            var next = proposals.Dequeue();
+            return Task.FromResult(new DecisionDebateOutcome(
+                Proposal: next,
+                PromptVersion: "v1-test",
+                FactJson: """{"isActionable":true}""",
+                BullJson: """{"thesis":"bull"}""",
+                BearJson: """{"thesis":"bear"}""",
+                SoftRiskJson: """{"risk":"low"}""",
+                JudgeJson: JsonSerializer.Serialize(next, SentiXJson.Options),
+                TotalTokens: 100,
+                TotalLatencyMs: 30,
+                FallbackUsed: false,
+                FailureReason: null));
+        }
+    }
+
+    private sealed class InMemoryPipelinePersistence : IPipelinePersistence
+    {
+        private readonly HashSet<string> proposalIds = new(StringComparer.Ordinal);
+        public string TradingStateRaw { get; set; } = "ACTIVE";
+
+        public Task RecordMarketEventAndFastPathAsync(MarketEvent marketEvent, string source, string rawPayload, FastPathResultRow fastPathRow, CancellationToken token) =>
+            Task.CompletedTask;
+
+        public Task<string[]> GetUpcomingScheduleDescriptionsAsync(DateTimeOffset nowUtc, CancellationToken token) =>
+            Task.FromResult(Array.Empty<string>());
+
+        public Task<bool> ProposalExistsAsync(string proposalId, CancellationToken token) =>
+            Task.FromResult(proposalIds.Contains(proposalId));
+
+        public Task<string?> ReadPersistedTradingStateAsync(CancellationToken token) =>
+            Task.FromResult<string?>(TradingStateRaw);
+
+        public Task PersistDebateAndRiskAsync(DecisionDebateRow debateRow, RiskEvaluationRow riskRow, CancellationToken token)
+        {
+            proposalIds.Add(debateRow.ProposalId);
             return Task.CompletedTask;
         }
     }
@@ -1101,81 +1430,56 @@ public sealed class Phase4IntegrationTests
 
     private sealed class StubUnixNativeServer : IAsyncDisposable
     {
-        private readonly System.Net.Sockets.Socket listener;
-        private readonly CancellationTokenSource cts = new();
-        private readonly Task acceptLoop;
+        private readonly MockUnixServer inner;
 
-        public string SocketPath { get; }
+        public string SocketPath => inner.Path;
 
-        private StubUnixNativeServer(string socketPath, System.Net.Sockets.Socket listener)
+        private StubUnixNativeServer()
         {
-            SocketPath = socketPath;
-            this.listener = listener;
-            acceptLoop = Task.Run(AcceptLoopAsync);
+            inner = new MockUnixServer((stream, request, token) => request.Type switch
+            {
+                IpcMessageType.HealthCheck => WriteEnvelopeAsync(
+                    stream,
+                    request,
+                    IpcMessageType.HealthCheckAck,
+                    new NativeHealth(NativeStatus.Ready, "0.1.0", true, 10, 0),
+                    token),
+                IpcMessageType.ScoreEvent => WriteEnvelopeAsync(
+                    stream,
+                    request,
+                    IpcMessageType.ScoreEventResult,
+                    new FastPathResult(
+                        request.Payload.GetProperty("eventId").GetString()!,
+                        false,
+                        "sha256:test",
+                        ["AAPL"],
+                        ["XLK"],
+                        new FinbertScores(0.90, 0.05, 0.05, 0.85),
+                        true,
+                        null,
+                        420),
+                    token),
+                _ => throw new InvalidDataException($"Unexpected IPC message type {request.Type}.")
+            });
         }
 
-        public static Task<StubUnixNativeServer> StartAsync()
+        public static Task<StubUnixNativeServer> StartAsync() => Task.FromResult(new StubUnixNativeServer());
+
+        private static async Task WriteEnvelopeAsync<T>(
+            Stream stream,
+            IpcEnvelope<JsonElement> request,
+            IpcMessageType responseType,
+            T payload,
+            CancellationToken token)
         {
-            var path = Path.Combine(Path.GetTempPath(), $"sx-p4-{Guid.NewGuid():N}.sock");
-            var socket = new System.Net.Sockets.Socket(
-                System.Net.Sockets.AddressFamily.Unix,
-                System.Net.Sockets.SocketType.Stream,
-                System.Net.Sockets.ProtocolType.Unspecified);
-            socket.Bind(new System.Net.Sockets.UnixDomainSocketEndPoint(path));
-            socket.Listen(4);
-            return Task.FromResult(new StubUnixNativeServer(path, socket));
+            var response = new IpcEnvelope<T>(1, request.CorrelationId, responseType, DateTimeOffset.UtcNow, payload);
+            var bytes = JsonSerializer.SerializeToUtf8Bytes(response, SentiXJson.Options);
+            var prefix = new byte[4];
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(prefix, (uint)bytes.Length);
+            await stream.WriteAsync(prefix, token);
+            await stream.WriteAsync(bytes, token);
         }
 
-        private async Task AcceptLoopAsync()
-        {
-            while (!cts.IsCancellationRequested)
-            {
-                try
-                {
-                    using var client = await listener.AcceptAsync(cts.Token);
-                    await using var stream = new System.Net.Sockets.NetworkStream(client, ownsSocket: false);
-                    var header = new byte[4];
-                    await stream.ReadExactlyAsync(header, cts.Token);
-                    var len = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(header);
-                    var reqBytes = new byte[len];
-                    await stream.ReadExactlyAsync(reqBytes, cts.Token);
-
-                    const string responseJson = """
-                        {"type":"score_event_response","event_id":"evt_pg_1","dedup_hash":"abc12345","is_duplicate":false,
-                         "matched_tickers":["AAPL"],"matched_sector_etfs":["XLK"],
-                         "finbert":{"positive":0.9,"negative":0.05,"neutral":0.05,"composite_score":0.85},
-                         "pass_to_decision_swarm":true,"drop_reason":null,"processing_time_us":420}
-                        """;
-                    var respBytes = Encoding.UTF8.GetBytes(responseJson);
-                    var respFrame = new byte[4 + respBytes.Length];
-                    System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(respFrame.AsSpan(0, 4), (uint)respBytes.Length);
-                    respBytes.CopyTo(respFrame.AsSpan(4));
-                    await stream.WriteAsync(respFrame, cts.Token);
-                }
-                catch
-                {
-                    break;
-                }
-            }
-        }
-
-        public async ValueTask DisposeAsync()
-        {
-            await cts.CancelAsync();
-            listener.Dispose();
-            try
-            {
-                await acceptLoop;
-            }
-            catch
-            {
-                // Ignore shutdown exceptions.
-            }
-            if (File.Exists(SocketPath))
-            {
-                File.Delete(SocketPath);
-            }
-            cts.Dispose();
-        }
+        public ValueTask DisposeAsync() => inner.DisposeAsync();
     }
 }

@@ -20,7 +20,8 @@ public sealed record PaperAccountSnapshot(
     double DailyPnLPct,
     IReadOnlyList<OpenPosition> OpenPositions,
     IReadOnlyList<PendingOrder> PendingOrders,
-    DateTimeOffset FetchedAtUtc);
+    DateTimeOffset FetchedAtUtc,
+    IReadOnlyDictionary<string, decimal?>? PendingOrderLimitPrices = null);
 
 /// <summary>Non-throwing structured result of fetching an authoritative paper portfolio snapshot.</summary>
 public sealed record PaperAccountSnapshotResult(
@@ -150,7 +151,7 @@ public sealed class AlpacaPaperPortfolioSnapshotProvider : IPaperPortfolioSnapsh
             return PaperAccountSnapshotResult.Failure(ExecutionRejectionCode.MalformedBrokerResponse, positionsError);
         }
 
-        if (!TryParsePendingOrders(ordersRes.Body!, out var pendingOrders, out var ordersError))
+        if (!TryParsePendingOrders(ordersRes.Body!, out var pendingOrders, out var pendingLimitPrices, out var ordersError))
         {
             return PaperAccountSnapshotResult.Failure(ExecutionRejectionCode.MalformedBrokerResponse, ordersError);
         }
@@ -162,7 +163,8 @@ public sealed class AlpacaPaperPortfolioSnapshotProvider : IPaperPortfolioSnapsh
             dailyPnLPct,
             openPositions,
             pendingOrders,
-            _timeProvider.GetUtcNow()));
+            _timeProvider.GetUtcNow(),
+            pendingLimitPrices));
     }
 
     internal static bool IsAllowedPaperReadUri(Uri? uri, string expectedPathAndQuery)
@@ -189,29 +191,47 @@ public sealed class AlpacaPaperPortfolioSnapshotProvider : IPaperPortfolioSnapsh
         return string.Equals(uri.PathAndQuery, expectedPathAndQuery, StringComparison.Ordinal);
     }
 
-    /// <summary>Resolves the sector name for <paramref name="symbol"/> from <paramref name="universe"/> (defaulting to <c>ETF</c>).</summary>
-    public static string ResolveSector(string symbol, UniverseConfig? universe)
+    /// <summary>
+    /// Resolves the sector for <paramref name="symbol"/> strictly from <paramref name="universe"/>:
+    /// watchlist equities return their configured sector, sector/benchmark ETFs return <c>ETF</c>,
+    /// and unknown tickers return <c>false</c> (fail-closed).
+    /// </summary>
+    public static bool TryResolveKnownSector(string? symbol, UniverseConfig? universe, out string sector)
     {
-        if (universe is not null)
+        sector = string.Empty;
+        if (string.IsNullOrWhiteSpace(symbol))
         {
-            var match = universe.Watchlist.FirstOrDefault(
-                entry => string.Equals(entry.Ticker, symbol, StringComparison.OrdinalIgnoreCase));
-            if (match is not null && !string.IsNullOrWhiteSpace(match.Sector))
-            {
-                return match.Sector;
-            }
-
-            foreach (var (sector, etfSymbol) in universe.SectorEtfs)
-            {
-                if (string.Equals(etfSymbol, symbol, StringComparison.OrdinalIgnoreCase))
-                {
-                    return sector;
-                }
-            }
+            return false;
         }
 
-        return "ETF";
+        var trimmed = symbol.Trim();
+        if (universe is null)
+        {
+            sector = "ETF";
+            return true;
+        }
+
+        var match = universe.Watchlist.FirstOrDefault(
+            entry => string.Equals(entry.Ticker, trimmed, StringComparison.OrdinalIgnoreCase));
+        if (match is not null && !string.IsNullOrWhiteSpace(match.Sector))
+        {
+            sector = match.Sector;
+            return true;
+        }
+
+        if (string.Equals(universe.BenchmarkTicker, trimmed, StringComparison.OrdinalIgnoreCase) ||
+            universe.SectorEtfs.Values.Any(etf => string.Equals(etf, trimmed, StringComparison.OrdinalIgnoreCase)))
+        {
+            sector = "ETF";
+            return true;
+        }
+
+        return false;
     }
+
+    /// <summary>Resolves the sector name for <paramref name="symbol"/> from <paramref name="universe"/> (defaulting to <c>ETF</c> for shadow fallback).</summary>
+    public static string ResolveSector(string symbol, UniverseConfig? universe) =>
+        TryResolveKnownSector(symbol, universe, out var sector) ? sector : "ETF";
 
     private async Task<(bool Success, string? Body, ExecutionRejectionCode FailureCode, string? Error)> GetJsonAsync(
         Uri requestUri,
@@ -435,9 +455,15 @@ public sealed class AlpacaPaperPortfolioSnapshotProvider : IPaperPortfolioSnapsh
                     : marketValue / qty;
 
                 var symbol = rawSymbol.Trim().ToUpperInvariant();
+                if (!TryResolveKnownSector(symbol, universe, out var resolvedSector))
+                {
+                    error = $"Alpaca /v2/positions symbol '{symbol}' is not in the configured SentiX universe.";
+                    return false;
+                }
+
                 list.Add(new OpenPosition(
                     symbol,
-                    ResolveSector(symbol, universe),
+                    resolvedSector,
                     qty,
                     marketValue,
                     currentPrice));
@@ -457,9 +483,11 @@ public sealed class AlpacaPaperPortfolioSnapshotProvider : IPaperPortfolioSnapsh
     private static bool TryParsePendingOrders(
         string json,
         out IReadOnlyList<PendingOrder> orders,
+        out IReadOnlyDictionary<string, decimal?> limitPrices,
         out string error)
     {
         orders = [];
+        limitPrices = new Dictionary<string, decimal?>(StringComparer.Ordinal);
         try
         {
             using var doc = JsonDocument.Parse(json);
@@ -477,6 +505,7 @@ public sealed class AlpacaPaperPortfolioSnapshotProvider : IPaperPortfolioSnapsh
             }
 
             var list = new List<PendingOrder>(capacity: length);
+            var priceMap = new Dictionary<string, decimal?>(capacity: length, StringComparer.Ordinal);
             foreach (var item in doc.RootElement.EnumerateArray())
             {
                 if (item.ValueKind != JsonValueKind.Object)
@@ -520,14 +549,19 @@ public sealed class AlpacaPaperPortfolioSnapshotProvider : IPaperPortfolioSnapsh
                     return false;
                 }
 
+                var trimmedId = clientOrderId.Trim();
+                var parsedLimitPrice = TryReadDecimal(item, "limit_price", out var lp) && lp > 0m ? lp : (decimal?)null;
+                priceMap[trimmedId] = parsedLimitPrice;
+
                 list.Add(new PendingOrder(
-                    clientOrderId.Trim(),
+                    trimmedId,
                     rawSymbol.Trim().ToUpperInvariant(),
                     side,
                     (int)qtyDecimal));
             }
 
             orders = list;
+            limitPrices = priceMap;
             error = string.Empty;
             return true;
         }

@@ -39,7 +39,7 @@ public sealed class PaperPortfolioSnapshotProviderTests
                      {"symbol":"XLK","qty":"10","market_value":"2100.00","current_price":"210.00"}]
                     """),
                 "/v2/orders?status=open&limit=500" => StubHttpMessageHandler.Json(HttpStatusCode.OK, """
-                    [{"id":"ord-1","client_order_id":"SX-20261127-NVDA-BUY-12345678","symbol":"NVDA","side":"buy","qty":"15"}]
+                    [{"id":"ord-1","client_order_id":"SX-20261127-NVDA-BUY-12345678","symbol":"NVDA","side":"buy","qty":"15","limit_price":"125.50"}]
                     """),
                 _ => new HttpResponseMessage(HttpStatusCode.NotFound)
             };
@@ -63,13 +63,14 @@ public sealed class PaperPortfolioSnapshotProviderTests
 
         Assert.Equal(2, result.Snapshot.OpenPositions.Count);
         Assert.Contains(result.Snapshot.OpenPositions, p => p.Ticker == "AAPL" && p.Sector == "Technology" && p.Quantity == 20 && p.MarketValue == 4_000m);
-        Assert.Contains(result.Snapshot.OpenPositions, p => p.Ticker == "XLK" && p.Sector == "Technology" && p.Quantity == 10);
+        Assert.Contains(result.Snapshot.OpenPositions, p => p.Ticker == "XLK" && p.Sector == "ETF" && p.Quantity == 10);
 
         var pending = Assert.Single(result.Snapshot.PendingOrders);
         Assert.Equal("SX-20261127-NVDA-BUY-12345678", pending.ClientOrderId);
         Assert.Equal("NVDA", pending.Ticker);
         Assert.Equal(SentiX.Risk.TradeAction.Buy, pending.Side);
         Assert.Equal(15, pending.Quantity);
+        Assert.Equal(125.50m, result.Snapshot.PendingOrderLimitPrices!["SX-20261127-NVDA-BUY-12345678"]);
     }
 
     [Theory]
@@ -101,6 +102,7 @@ public sealed class PaperPortfolioSnapshotProviderTests
     [InlineData("""{"equity":"100000","last_equity":"0","buying_power":"100000"}""", "[]", "[]")]
     [InlineData("""{"equity":"100000","last_equity":"100000","buying_power":"100000"}""", """[{"symbol":"AAPL","qty":"-5","market_value":"1000"}]""", "[]")]
     [InlineData("""{"equity":"100000","last_equity":"100000","buying_power":"100000"}""", """[{"symbol":"AAPL","qty":"1.5","market_value":"300"}]""", "[]")]
+    [InlineData("""{"equity":"100000","last_equity":"100000","buying_power":"100000"}""", """[{"symbol":"ZZZZ","qty":"5","market_value":"500"}]""", "[]")]
     [InlineData("""{"equity":"100000","last_equity":"100000","buying_power":"100000"}""", "[]", """[{"id":"1","symbol":"AAPL","side":"buy","qty":"0.5"}]""")]
     public async Task GetSnapshotAsync_FailsClosedOnBlockedAccountShortOrFractionalState(
         string accountJson,
