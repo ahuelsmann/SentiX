@@ -158,10 +158,23 @@ public sealed class Phase4IntegrationTests
             Assert.Equal("ACTIVE", doc.RootElement.GetProperty("tradingState").GetString());
         }
 
-        // Circuit breaker states (HALTED_DAILY_LOSS and HALTED_SYSTEM_ERROR) MUST block manual UI resume with 409 Conflict!
+        // Circuit breaker states (HALTED_DAILY_LOSS and HALTED_SYSTEM_ERROR) MUST NEVER be downgraded by manual /halt
+        // and MUST still block manual UI /resume with 409 Conflict!
         foreach (var nonManualHalt in new[] { RiskTradingState.HaltedDailyLoss, RiskTradingState.HaltedSystemError })
         {
             stateStore.SetState(nonManualHalt);
+            var expectedPersisted = PersistedTradingStateFormat.ToDatabaseValue(nonManualHalt);
+
+            using var haltAttemptReq = new HttpRequestMessage(HttpMethod.Post, "/api/system-state/halt");
+            haltAttemptReq.Headers.Add("Origin", "http://localhost:8080");
+            haltAttemptReq.Headers.Add("X-SentiX-Confirm", "HALT");
+            using var haltAttemptRes = await client.SendAsync(haltAttemptReq);
+            Assert.Equal(HttpStatusCode.OK, haltAttemptRes.StatusCode);
+            using (var haltDoc = JsonDocument.Parse(await haltAttemptRes.Content.ReadAsStringAsync()))
+            {
+                Assert.Equal(expectedPersisted, haltDoc.RootElement.GetProperty("tradingState").GetString());
+            }
+
             using var resumeBlockedReq = new HttpRequestMessage(HttpMethod.Post, "/api/system-state/resume");
             resumeBlockedReq.Headers.Add("X-SentiX-Confirm", "RESUME");
             using var resumeBlockedRes = await client.SendAsync(resumeBlockedReq);
@@ -169,8 +182,178 @@ public sealed class Phase4IntegrationTests
             using var doc = JsonDocument.Parse(await resumeBlockedRes.Content.ReadAsStringAsync());
             Assert.Equal("cannot_resume_state", doc.RootElement.GetProperty("error").GetString());
             Assert.Equal("CannotResumeNonManualHalt", doc.RootElement.GetProperty("code").GetString());
-            Assert.Equal(PersistedTradingStateFormat.ToDatabaseValue(nonManualHalt), doc.RootElement.GetProperty("tradingState").GetString());
+            Assert.Equal(expectedPersisted, doc.RootElement.GetProperty("tradingState").GetString());
         }
+    }
+
+    [Fact]
+    public async Task ArmedMode_AuthoritativePortfolioSnapshot_BlocksOnUnavailableDuplicateCooldownAndSectorExposure()
+    {
+        var universe = UniverseConfigLoader.Load(UniverseAndXTests.UniversePath);
+        var quotes = new InMemoryMarketQuoteCache();
+        quotes.Update(new MarketQuoteSnapshot("AAPL", 199.90m, 200.00m, 199.95m, 5.0, FixedRegularMarketUtc));
+
+        var proposal = new TradeProposal(
+            "prop_arm_1",
+            "evt_arm_1",
+            TradeAction.Buy,
+            "AAPL",
+            InstrumentType.Equity,
+            0.90,
+            24,
+            0.03m,
+            0.06m,
+            "Catalyst",
+            "None");
+
+        // (a) Shadow Mode uses synthetic $100k portfolio with ZERO calls to IPaperPortfolioSnapshotProvider
+        var throwingPortfolioProvider = new StubPaperPortfolioProvider(_ => throw new InvalidOperationException("Must not call in Shadow Mode."));
+        var shadowAuditStore = new InMemoryOrderAuditStore();
+        using (var shadowPipeline = new MarketEventPipeline(
+            new ThrowingContextFactory(),
+            new NativeBridgeClient(Path.Combine(Path.GetTempPath(), $"sx-sh-{Guid.NewGuid():N}.sock")),
+            NullLogger<MarketEventPipeline>.Instance,
+            isConfigured: false,
+            quoteCache: quotes,
+            universe: universe,
+            timeProvider: new FixedClock(FixedRegularMarketUtc),
+            paperOptions: new AlpacaPaperOptions { TradingEnabled = false },
+            paperPortfolioProvider: throwingPortfolioProvider,
+            orderAuditStore: shadowAuditStore))
+        {
+            var shadowDecision = MarketEventPipeline.EvaluateShadowHardRisk(
+                proposal, "AAPL", quotes, universe, RiskTradingState.Active, FixedRegularMarketUtc);
+            Assert.True(shadowDecision.Approved);
+            Assert.Equal(0, throwingPortfolioProvider.Calls);
+        }
+
+        // (b) Armed Mode fails closed (SnapshotAvailable == false, Decision == null) when portfolio fetch fails — NEVER falls back to $100k!
+        var failingPortfolioProvider = new StubPaperPortfolioProvider(_ =>
+            PaperAccountSnapshotResult.Failure(ExecutionRejectionCode.BrokerTimeout, "Alpaca /v2/account timed out."));
+        using (var failingPipeline = new MarketEventPipeline(
+            new ThrowingContextFactory(),
+            new NativeBridgeClient(Path.Combine(Path.GetTempPath(), $"sx-f-{Guid.NewGuid():N}.sock")),
+            NullLogger<MarketEventPipeline>.Instance,
+            isConfigured: true,
+            quoteCache: quotes,
+            universe: universe,
+            timeProvider: new FixedClock(FixedRegularMarketUtc),
+            paperOptions: new AlpacaPaperOptions { TradingEnabled = true },
+            paperPortfolioProvider: failingPortfolioProvider,
+            orderAuditStore: shadowAuditStore))
+        {
+            var unavailableEval = await failingPipeline.EvaluateArmedPaperRiskAsync(
+                proposal, "AAPL", RiskTradingState.Active, FixedRegularMarketUtc, CancellationToken.None);
+            Assert.False(unavailableEval.SnapshotAvailable);
+            Assert.Null(unavailableEval.Decision);
+            Assert.Equal(1, failingPortfolioProvider.Calls);
+        }
+
+        // (c1) Armed Mode blocks duplicate position when Alpaca /v2/positions already holds AAPL
+        var openPositionSnapshot = new PaperAccountSnapshot(
+            Equity: 100_000m,
+            LastEquity: 100_000m,
+            BuyingPower: 90_000m,
+            DailyPnLPct: 0.0,
+            OpenPositions: [new SentiX.Risk.OpenPosition("AAPL", "Technology", 10, 2_000m, 200m)],
+            PendingOrders: [],
+            FetchedAtUtc: FixedRegularMarketUtc);
+        var (_, _, dupPosDecision, _) = MarketEventPipeline.EvaluateArmedHardRiskFromSnapshots(
+            proposal, "AAPL", quotes, universe, RiskTradingState.Active, openPositionSnapshot, [], FixedRegularMarketUtc);
+        Assert.False(dupPosDecision.Approved);
+        Assert.Contains(dupPosDecision.Violations, v => v.Code == SentiX.Risk.RiskViolationCode.DuplicatePosition);
+
+        // (c2) Armed Mode blocks duplicate when local orders has an in-flight PENDING_SUBMIT intent
+        var cleanAccount = openPositionSnapshot with { OpenPositions = [] };
+        var inFlightPendingRow = new OrderRow(
+            "SX-20260604-AAPL-BUY-prior001", null, "prop_prior", "AAPL", "BUY", "LIMIT",
+            25, 200m, 194m, 212m, "PENDING_SUBMIT", null,
+            FixedRegularMarketUtc.AddMinutes(-2), FixedRegularMarketUtc.AddMinutes(-2));
+        var (_, _, pendingDupDecision, _) = MarketEventPipeline.EvaluateArmedHardRiskFromSnapshots(
+            proposal, "AAPL", quotes, universe, RiskTradingState.Active, cleanAccount, [inFlightPendingRow], FixedRegularMarketUtc);
+        Assert.False(pendingDupDecision.Approved);
+        Assert.Contains(pendingDupDecision.Violations, v => v.Code == SentiX.Risk.RiskViolationCode.DuplicatePosition);
+        Assert.Contains(pendingDupDecision.Violations, v => v.Code == SentiX.Risk.RiskViolationCode.TickerCooldownActive);
+
+        // (c3) Armed Mode blocks sector over-exposure (> 25% of $100k equity in TECH sector)
+        var heavyTechSnapshot = cleanAccount with
+        {
+            OpenPositions = [new SentiX.Risk.OpenPosition("MSFT", AlpacaPaperPortfolioSnapshotProvider.ResolveSector("MSFT", universe), 56, 22_500m, 401.79m)] // 22.5% + 5.0% = 27.5% > 25%
+        };
+        var (_, _, sectorBlockedDecision, _) = MarketEventPipeline.EvaluateArmedHardRiskFromSnapshots(
+            proposal, "AAPL", quotes, universe, RiskTradingState.Active, heavyTechSnapshot, [], FixedRegularMarketUtc);
+        Assert.False(sectorBlockedDecision.Approved);
+        Assert.Contains(sectorBlockedDecision.Violations, v => v.Code == SentiX.Risk.RiskViolationCode.SectorExposureExceeded);
+
+        // (c4) Armed Mode blocks when authoritative paper account breached fractional daily loss limit (-2.5% <= -2.0%)
+        var dailyLossSnapshot = cleanAccount with { DailyPnLPct = -0.025 };
+        var (_, _, dailyLossDecision, _) = MarketEventPipeline.EvaluateArmedHardRiskFromSnapshots(
+            proposal, "AAPL", quotes, universe, RiskTradingState.Active, dailyLossSnapshot, [], FixedRegularMarketUtc);
+        Assert.False(dailyLossDecision.Approved);
+        Assert.Equal(RiskTradingState.HaltedDailyLoss, dailyLossDecision.EffectiveTradingState);
+        Assert.Contains(dailyLossDecision.Violations, v => v.Code == SentiX.Risk.RiskViolationCode.DailyLossLimitReached);
+    }
+
+    [Fact]
+    public async Task WriteAheadOrderIntent_BlocksBrokerOnInsertFailure_AndPreservesPendingSubmitWhenPostUpdateFails()
+    {
+        var universe = UniverseConfigLoader.Load(UniverseAndXTests.UniversePath);
+        var quotes = new InMemoryMarketQuoteCache();
+        quotes.Update(new MarketQuoteSnapshot("AAPL", 199.90m, 200.00m, 199.95m, 5.0, FixedRegularMarketUtc));
+        var proposal = new TradeProposal(
+            "prop_wal_1", "evt_wal_1", TradeAction.Buy, "AAPL", InstrumentType.Equity,
+            0.90, 24, 0.03m, 0.06m, "Catalyst", "None");
+        var (riskProposal, entryPrice, riskDecision) = MarketEventPipeline.EvaluateHardRiskWithInputs(
+            proposal, "AAPL", quotes, universe, RiskTradingState.Active, FixedRegularMarketUtc);
+        Assert.True(riskDecision.Approved);
+
+        var engineCalls = 0;
+        var fakeEngine = new StubPaperExecutionEngine(req =>
+        {
+            engineCalls++;
+            return new PaperExecutionResult(
+                ExecutionOutcomeStatus.Submitted,
+                ExecutionRejectionCode.None,
+                null,
+                req.RiskDecision.ClientOrderId,
+                RiskTradingState.Active,
+                new AlpacaOrderReceipt(
+                    "alp-wal-1", req.RiskDecision.ClientOrderId!, "AAPL", "accepted", "buy", "limit",
+                    "bracket", "25", 200m, null, FixedRegularMarketUtc, FixedRegularMarketUtc),
+                null,
+                FixedRegularMarketUtc);
+        });
+
+        // (a) Write-ahead PENDING_SUBMIT insert fails -> ZERO broker calls!
+        var failBeginStore = new InMemoryOrderAuditStore { FailBegin = true };
+        await MarketEventPipeline.ExecuteAndPersistPaperOrderWithWriteAheadAsync(
+            proposal.ProposalId, "AAPL", proposal.Action, riskProposal, riskDecision, entryPrice, 0,
+            failBeginStore, fakeEngine, new FixedClock(FixedRegularMarketUtc), NullLogger.Instance, CancellationToken.None);
+        Assert.Equal(0, engineCalls);
+        Assert.Empty(failBeginStore.Rows);
+
+        // (b) Broker accepts order + post-submit DB update fails -> durable PENDING_SUBMIT row remains visible!
+        var failCompleteStore = new InMemoryOrderAuditStore { FailComplete = true };
+        await MarketEventPipeline.ExecuteAndPersistPaperOrderWithWriteAheadAsync(
+            proposal.ProposalId, "AAPL", proposal.Action, riskProposal, riskDecision, entryPrice, 0,
+            failCompleteStore, fakeEngine, new FixedClock(FixedRegularMarketUtc), NullLogger.Instance, CancellationToken.None);
+        Assert.Equal(1, engineCalls);
+        var durablePending = Assert.Single(failCompleteStore.Rows.Values);
+        Assert.Equal(riskDecision.ClientOrderId, durablePending.ClientOrderId);
+        Assert.Equal("PENDING_SUBMIT", durablePending.Status);
+
+        // (c) Interrupted PENDING_SUBMIT reconciles on retry and transitions to ACCEPTED, then subsequent replay skips with 0 extra calls!
+        failCompleteStore.FailComplete = false;
+        await MarketEventPipeline.ExecuteAndPersistPaperOrderWithWriteAheadAsync(
+            proposal.ProposalId, "AAPL", proposal.Action, riskProposal, riskDecision, entryPrice, 0,
+            failCompleteStore, fakeEngine, new FixedClock(FixedRegularMarketUtc.AddSeconds(5)), NullLogger.Instance, CancellationToken.None);
+        Assert.Equal(2, engineCalls);
+        Assert.Equal("ACCEPTED", Assert.Single(failCompleteStore.Rows.Values).Status);
+
+        await MarketEventPipeline.ExecuteAndPersistPaperOrderWithWriteAheadAsync(
+            proposal.ProposalId, "AAPL", proposal.Action, riskProposal, riskDecision, entryPrice, 0,
+            failCompleteStore, fakeEngine, new FixedClock(FixedRegularMarketUtc.AddSeconds(10)), NullLogger.Instance, CancellationToken.None);
+        Assert.Equal(2, engineCalls); // Skipped because already ACCEPTED!
     }
 
     [Fact]
@@ -380,6 +563,15 @@ public sealed class Phase4IntegrationTests
                         FixedRegularMarketUtc));
             });
 
+            var stubPortfolioProvider = new StubPaperPortfolioProvider(_ => PaperAccountSnapshotResult.Success(new PaperAccountSnapshot(
+                Equity: 100_000m,
+                LastEquity: 100_000m,
+                BuyingPower: 100_000m,
+                DailyPnLPct: 0.0,
+                OpenPositions: [],
+                PendingOrders: [],
+                FetchedAtUtc: FixedRegularMarketUtc)));
+
             // 1. Fresh DB startup automatically migrates schema & seeds system_state (id=1, ACTIVE)
             using var factory = CreateHostFactory(
                 new Dictionary<string, string?>
@@ -398,6 +590,8 @@ public sealed class Phase4IntegrationTests
                     services.AddSingleton<TimeProvider>(new FixedClock(FixedRegularMarketUtc));
                     services.RemoveAll<IAlpacaPaperBrokerClient>();
                     services.AddSingleton<IAlpacaPaperBrokerClient>(stubBroker);
+                    services.RemoveAll<IPaperPortfolioSnapshotProvider>();
+                    services.AddSingleton<IPaperPortfolioSnapshotProvider>(stubPortfolioProvider);
                 });
 
             using var client = factory.CreateClient();
@@ -427,13 +621,21 @@ public sealed class Phase4IntegrationTests
                     $"UPDATE system_state SET trading_state = 'HALTED_DAILY_LOSS' WHERE id = 1");
             }
 
+            // H2: HaltManualAsync MUST NOT downgrade HALTED_DAILY_LOSS to HALTED_MANUAL!
+            var haltOverDailyLoss = await stateStore.HaltManualAsync("OPERATOR_UI", CancellationToken.None);
+            Assert.Equal(TradingStateWriteStatus.Updated, haltOverDailyLoss.Status);
+            Assert.Equal("HALTED_DAILY_LOSS", haltOverDailyLoss.CurrentState);
+
             var blockedResume = await stateStore.ResumeManualAsync("OPERATOR_UI", CancellationToken.None);
             Assert.Equal(TradingStateWriteStatus.CannotResumeNonManualHalt, blockedResume.Status);
             Assert.Equal("HALTED_DAILY_LOSS", blockedResume.CurrentState);
 
-            // Restore ACTIVE via manual halt -> manual resume, then verify pipeline execution & orders persistence
-            await stateStore.HaltManualAsync("OPERATOR_UI", CancellationToken.None);
-            await stateStore.ResumeManualAsync("OPERATOR_UI", CancellationToken.None);
+            // DB-level circuit-breaker recovery back to ACTIVE, then verify pipeline execution & write-ahead orders persistence
+            await using (var db = await dbFactory.CreateDbContextAsync())
+            {
+                await db.Database.ExecuteSqlInterpolatedAsync(
+                    $"UPDATE system_state SET trading_state = 'ACTIVE' WHERE id = 1");
+            }
 
             var quotes = factory.Services.GetRequiredService<IMarketQuoteCache>();
             quotes.Update(new MarketQuoteSnapshot("AAPL", 199.90m, 200.00m, 199.95m, 5.0, FixedRegularMarketUtc));
@@ -463,7 +665,9 @@ public sealed class Phase4IntegrationTests
                 factory.Services.GetRequiredService<UniverseConfig>(),
                 new FixedClock(FixedRegularMarketUtc),
                 factory.Services.GetRequiredService<IPaperExecutionEngine>(),
-                factory.Services.GetRequiredService<AlpacaPaperOptions>());
+                factory.Services.GetRequiredService<AlpacaPaperOptions>(),
+                factory.Services.GetRequiredService<IPaperPortfolioSnapshotProvider>(),
+                factory.Services.GetRequiredService<IPaperOrderAuditStore>());
 
             var marketEvent = new MarketEvent(
                 "evt_pg_1",
@@ -535,10 +739,10 @@ public sealed class Phase4IntegrationTests
         {
             lock (gate)
             {
-                state = RiskTradingState.HaltedManual;
+                state = PersistedTradingStateFormat.ApplyManualHalt(state);
                 return Task.FromResult(new TradingStateWriteResult(
                     TradingStateWriteStatus.Updated,
-                    "HALTED_MANUAL",
+                    PersistedTradingStateFormat.ToDatabaseValue(state),
                     PersistedTradingStateFormat.SanitizeActor(updatedBy),
                     nowUtc));
             }
@@ -603,6 +807,65 @@ public sealed class Phase4IntegrationTests
     {
         public Task<BrokerSubmissionResult> SubmitOrderAsync(AlpacaBracketOrderRequest order, CancellationToken cancellationToken) =>
             Task.FromResult(handler(order));
+    }
+
+    private sealed class StubPaperPortfolioProvider(Func<UniverseConfig?, PaperAccountSnapshotResult> handler) : IPaperPortfolioSnapshotProvider
+    {
+        public int Calls { get; private set; }
+
+        public Task<PaperAccountSnapshotResult> GetSnapshotAsync(UniverseConfig? universe, CancellationToken cancellationToken)
+        {
+            Calls++;
+            return Task.FromResult(handler(universe));
+        }
+    }
+
+    private sealed class StubPaperExecutionEngine(Func<PaperOrderExecutionRequest, PaperExecutionResult> handler) : IPaperExecutionEngine
+    {
+        public Task<PaperExecutionResult> ExecuteAsync(PaperOrderExecutionRequest request, CancellationToken cancellationToken) =>
+            Task.FromResult(handler(request));
+    }
+
+    private sealed class InMemoryOrderAuditStore : IPaperOrderAuditStore
+    {
+        public Dictionary<string, OrderRow> Rows { get; } = new(StringComparer.Ordinal);
+        public bool FailBegin { get; set; }
+        public bool FailComplete { get; set; }
+
+        public Task<RecentOrderAuditReadResult> GetRecentOrdersAsync(DateTimeOffset sinceUtc, CancellationToken cancellationToken) =>
+            Task.FromResult(new RecentOrderAuditReadResult(true, Rows.Values.Where(r => r.UpdatedAtUtc >= sinceUtc).ToArray()));
+
+        public Task<OrderIntentDisposition> TryBeginOrderIntentAsync(OrderRow pendingIntentRow, CancellationToken cancellationToken)
+        {
+            if (FailBegin)
+            {
+                return Task.FromResult(OrderIntentDisposition.FailedClosed);
+            }
+
+            if (Rows.TryGetValue(pendingIntentRow.ClientOrderId, out var existing))
+            {
+                if (string.Equals(existing.Status, "PENDING_SUBMIT", StringComparison.OrdinalIgnoreCase))
+                {
+                    Rows[pendingIntentRow.ClientOrderId] = existing with { UpdatedAtUtc = pendingIntentRow.UpdatedAtUtc };
+                    return Task.FromResult(OrderIntentDisposition.ProceedToSubmit);
+                }
+
+                return Task.FromResult(OrderIntentDisposition.AlreadyFinalizedSkip);
+            }
+
+            Rows[pendingIntentRow.ClientOrderId] = pendingIntentRow;
+            return Task.FromResult(OrderIntentDisposition.ProceedToSubmit);
+        }
+
+        public Task CompleteOrderIntentAsync(OrderRow completedRow)
+        {
+            if (!FailComplete)
+            {
+                Rows[completedRow.ClientOrderId] = completedRow;
+            }
+
+            return Task.CompletedTask;
+        }
     }
 
     private sealed class StubDecisionSwarm(TradeProposal proposal) : IDecisionSwarmOrchestrator

@@ -66,32 +66,36 @@
   - Valid persisted strings (`"ACTIVE"`, `"HALTED_MANUAL"`, `"HALTED_DAILY_LOSS"`, `"HALTED_SYSTEM_ERROR"`) return `TradingStateReadResult(Success: true, State: ...)`.
   - Missing row (`id = 1`), empty/unknown string, unconfigured database (`UnconfiguredTradingStateStore`), or database exception returns `TradingStateReadResult(Success: false, State: TradingState.HaltedSystemError, ErrorReason: ...)` without throwing unhandled exceptions.
 - **Operator State Transitions:**
-  - `HaltManualAsync(updatedBy, ct)`: Sanitizes `updatedBy` (trimmed, non-empty, `<= 64` chars) and atomically upserts `system_state (id = 1)` to `trading_state = 'HALTED_MANUAL'`, `updated_at_utc = clock.GetUtcNow()`. Emergency manual halt is permitted from **any** state whenever PostgreSQL is reachable.
+  - `HaltManualAsync(updatedBy, ct)`: Sanitizes `updatedBy` (trimmed, non-empty, `<= 64` chars) and atomically upserts `system_state (id = 1)` to `trading_state = 'HALTED_MANUAL'`, `updated_at_utc = clock.GetUtcNow()` **only** when `system_state.trading_state NOT IN ('HALTED_DAILY_LOSS', 'HALTED_SYSTEM_ERROR')`. Emergency manual halt never downgrades a stronger non-resumable circuit-breaker halt (`HALTED_DAILY_LOSS` or `HALTED_SYSTEM_ERROR`) and returns the effective persisted `trading_state`.
   - `ResumeManualAsync(updatedBy, ct)`: Atomically transitions `system_state (id = 1)` to `'ACTIVE'` **only** when `trading_state` is `'HALTED_MANUAL'` (or idempotently `'ACTIVE'`). If `trading_state` is `'HALTED_DAILY_LOSS'`, `'HALTED_SYSTEM_ERROR'`, missing, or unknown, it fails closed with `CannotResumeNonManualHalt` (`409 Conflict`) so an operator UI click can never bypass a daily-loss circuit breaker or system-error halt.
 
 ### 3.2 Startup Database Readiness (`DatabaseStartupInitializer`)
 - `SentiX.Host` registers a startup `IHostedService` ahead of market collectors that invokes `IMarketEventPipeline.EnsureReadyAsync` when `ConnectionStrings:Default` is configured.
 - Applies EF Core migrations and seeds `system_state (id = 1, 'ACTIVE')` on fresh PostgreSQL 17 deployments (`docker compose up`) before `/api/overview` or collector workers run, while catching and logging transient startup connectivity errors without crashing the host process.
 
-### 3.3 `MarketEventPipeline` Phase 4 Order Execution & `orders` Persistence
+### 3.3 `MarketEventPipeline` Phase 4 Authoritative Account Snapshot & Write-Ahead `orders` Persistence
 - `SentiX.Risk` remains 100 % untouched (`0` changes).
-- After `decision_debates` and `risk_evaluations` are committed in `MarketEventPipeline`:
-  - When `AlpacaPaperOptions.TradingEnabled == false` (default Shadow Mode), zero calls are made to `IPaperExecutionEngine` and zero rows are written to `orders`.
-  - When `AlpacaPaperOptions.TradingEnabled == true`, `riskDecision.Approved == true`, `proposal.Action != HOLD`, and `riskDecision.ClientOrderId` is non-empty, `MarketEventPipeline` constructs `PaperOrderExecutionRequest.FromRiskDecision(...)` using the exact `TradeProposal` and quote `entryPrice` evaluated by `HardRiskManager`.
-  - If `orders` does not already contain `ClientOrderId`, `IPaperExecutionEngine.ExecuteAsync` is invoked and the resulting `OrderRow` is persisted idempotently (`SUBMITTED` / broker status, `DUPLICATE`, `REJECTED_PREFLIGHT`, or `FAILED_BROKER`) in an isolated post-debate unit of work so unexpected persistence errors never roll back or corrupt the committed debate/risk audit trail.
+- **Shadow Mode vs. Armed Paper Risk Snapshot:**
+  - When `AlpacaPaperOptions.TradingEnabled == false` (default Shadow Mode), `HardRiskManager` evaluates against the synthetic `$100k` empty shadow portfolio with **zero** broker HTTP calls and **zero** `orders` writes.
+  - When `AlpacaPaperOptions.TradingEnabled == true` (Armed Mode), `MarketEventPipeline` fetches the authoritative paper portfolio via `IPaperPortfolioSnapshotProvider` (`GET /v2/account`, `GET /v2/positions`, `GET /v2/orders?status=open&limit=500` strictly on `https://paper-api.alpaca.markets` with `AllowAutoRedirect = false` and `256 KiB` cap) plus recent local `orders` (`LastTradeTimesUtc` cooldowns and in-flight `PENDING_SUBMIT` intents).
+  - If the authoritative paper portfolio or local order history is unavailable, invalid, or blocked, `MarketEventPipeline` **never** falls back to the synthetic `$100k` portfolio: it records `RiskEvaluationRow` (`Approved = false`, `PAPER_PORTFOLIO_UNAVAILABLE`) and performs **zero** broker order submissions.
+- **Durable Write-Ahead `PENDING_SUBMIT` Intent (`IPaperOrderAuditStore`):**
+  - Before calling `IPaperExecutionEngine.ExecuteAsync`, `MarketEventPipeline` durably records an `OrderRow` with `Status = "PENDING_SUBMIT"` for the deterministic `ClientOrderId`.
+  - Existing finalized rows (`!= "PENDING_SUBMIT"`) skip submission idempotently (`0` broker calls); existing `"PENDING_SUBMIT"` rows from interrupted attempts reconcile via the identical `ClientOrderId`; write-ahead DB failures fail closed (`0` broker calls).
+  - Post-submit receipt completion updates the row using `CancellationToken.None` with a bounded timeout so shutdown/request cancellation cannot drop an accepted broker receipt, while preserving the durable `"PENDING_SUBMIT"` row if PostgreSQL becomes unreachable mid-flight.
 
 ### 3.4 Loopback HTTP Telemetry, Orders & Kill-Switch API (`TelemetryEndpoints`)
 - All endpoints emit `Cache-Control: no-store`.
 - `GET /health` & `GET /api/overview`:
   - Report `phase = 4`, `tradingState` (`"ACTIVE"`, `"HALTED_MANUAL"`, `"HALTED_DAILY_LOSS"`, `"HALTED_SYSTEM_ERROR"`, or `"UNAVAILABLE"`), `paperSwitchArmed` (`AlpacaPaperOptions.TradingEnabled`), `paperExecutionConfigured` (`AlpacaPaperOptions.IsConfigured`), and effective `tradingEnabled` / `orderExecutionEnabled` (`paperSwitchArmed && tradingState == "ACTIVE"`).
-  - `/api/overview` additionally includes `counts.ordersTotal`, `counts.ordersSubmitted`, `counts.ordersRejected`, and `latestOrders` (newest 10 rows).
+  - `/api/overview` additionally includes `counts.ordersTotal`, `counts.ordersSubmitted`, `counts.ordersPending` (`Status == "PENDING_SUBMIT"`), `counts.ordersRejected`, and `latestOrders` (newest 10 rows).
 - `GET /api/orders?limit=25`:
   - Returns `{ items, databaseConfigured }` ordered by `updated_at_utc DESC, submitted_at_utc DESC, client_order_id ASC` (`limit` clamped to `1..100`).
 - `POST /api/system-state/halt` & `POST /api/system-state/resume`:
   - Reject requests carrying a non-loopback `Origin` header (host other than `localhost` or `127.0.0.1`) with `403 Forbidden` (`{ error = "forbidden_origin" }`).
   - Require exact ordinal header `X-SentiX-Confirm: HALT` (on `/halt`) or `X-SentiX-Confirm: RESUME` (on `/resume`); missing or mismatched values return `400 Bad Request` (`{ error = "missing_confirmation_header" }`).
   - Return `503 Service Unavailable` when PostgreSQL is unconfigured (`database_not_configured`) or unreachable (`database_unavailable`).
-  - `/halt` transitions `system_state` to `HALTED_MANUAL` (`200 OK`).
+  - `/halt` transitions `ACTIVE` / `HALTED_MANUAL` to `HALTED_MANUAL` without downgrading `HALTED_DAILY_LOSS` or `HALTED_SYSTEM_ERROR`, returning the effective `tradingState` (`200 OK`).
   - `/resume` transitions `HALTED_MANUAL` (or `ACTIVE`) to `ACTIVE` (`200 OK`), or fails closed with `409 Conflict` (`{ error = "cannot_resume_state", code = "CannotResumeNonManualHalt", tradingState }`) on `HALTED_DAILY_LOSS` / `HALTED_SYSTEM_ERROR`.
 
 ### 3.5 Phase 4 Cockpit UI (`src/web`)

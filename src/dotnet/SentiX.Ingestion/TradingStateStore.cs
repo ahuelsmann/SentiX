@@ -45,6 +45,15 @@ public static class PersistedTradingStateFormat
         _ => "HALTED_SYSTEM_ERROR"
     };
 
+    /// <summary>
+    /// Applies a manual operator halt without ever downgrading a stronger non-resumable circuit-breaker halt
+    /// (<see cref="TradingState.HaltedDailyLoss"/> or <see cref="TradingState.HaltedSystemError"/>).
+    /// </summary>
+    public static TradingState ApplyManualHalt(TradingState current) =>
+        current is TradingState.HaltedDailyLoss or TradingState.HaltedSystemError
+            ? current
+            : TradingState.HaltedManual;
+
     public static string SanitizeActor(string? updatedBy)
     {
         if (string.IsNullOrWhiteSpace(updatedBy))
@@ -174,6 +183,8 @@ public sealed class EfCoreTradingStateStore(
         try
         {
             await using var db = await dbFactory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+            await using var tx = await db.Database.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+
             await db.Database.ExecuteSqlInterpolatedAsync($"""
                 INSERT INTO system_state (id, trading_state, reason, updated_by, updated_at_utc)
                 VALUES (1, 'HALTED_MANUAL', {reason}, {actor}, {now})
@@ -182,13 +193,37 @@ public sealed class EfCoreTradingStateStore(
                     reason = EXCLUDED.reason,
                     updated_by = EXCLUDED.updated_by,
                     updated_at_utc = EXCLUDED.updated_at_utc
+                WHERE system_state.trading_state NOT IN ('HALTED_DAILY_LOSS', 'HALTED_SYSTEM_ERROR')
                 """, cancellationToken).ConfigureAwait(false);
+
+            var currentRow = await db.SystemState.AsNoTracking()
+                .Where(s => s.Id == 1)
+                .SingleOrDefaultAsync(cancellationToken)
+                .ConfigureAwait(false);
+
+            await tx.CommitAsync(cancellationToken).ConfigureAwait(false);
+
+            if (currentRow is null)
+            {
+                return new TradingStateWriteResult(
+                    TradingStateWriteStatus.Unavailable,
+                    "UNAVAILABLE",
+                    actor,
+                    now,
+                    "DatabaseUnavailable",
+                    "Persisted system_state row (id=1) missing after halt.");
+            }
+
+            var parsed = SystemStateParser.Parse(currentRow.TradingState);
+            var effectiveState = parsed.Success
+                ? PersistedTradingStateFormat.ToDatabaseValue(parsed.State)
+                : "HALTED_SYSTEM_ERROR";
 
             return new TradingStateWriteResult(
                 TradingStateWriteStatus.Updated,
-                "HALTED_MANUAL",
-                actor,
-                now);
+                effectiveState,
+                currentRow.UpdatedBy,
+                currentRow.UpdatedAtUtc);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {

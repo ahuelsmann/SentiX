@@ -5,6 +5,7 @@ import {
   postKillSwitchAction,
   readTelemetry,
   resolveOrderExecution,
+  resolvePaperExecutionConfigured,
   resolvePaperSwitchArmed,
   resolveTradingState,
 } from '../src/telemetry.ts'
@@ -112,7 +113,8 @@ test('decodes Phase 4 kill-switch state, paper flags, and orders while skipping 
       native: 'ready',
       tradingState: 'HALTED_MANUAL',
       paperSwitchArmed: true,
-      paperExecutionConfigured: true,
+      paperExecutionConfigured: false,
+      databaseReachable: false,
       tradingEnabled: false,
       orderExecutionEnabled: false,
     },
@@ -123,26 +125,36 @@ test('decodes Phase 4 kill-switch state, paper flags, and orders while skipping 
       paperSwitchArmed: true,
       paperExecutionConfigured: true,
       orderExecutionEnabled: false,
-      counts: { events: 5, ordersTotal: 2, ordersSubmitted: 1, ordersRejected: 1 },
+      counts: { events: 5, ordersTotal: 3, ordersSubmitted: 1, ordersPending: 1, ordersRejected: 1 },
     },
     '/api/orders?limit=25': {
-      items: [validOrder, { ...validOrder, qty: 0 }, { clientOrderId: 'bad' }],
+      items: [
+        validOrder,
+        { ...validOrder, clientOrderId: 'SX-20260604-AAPL-BUY-pend0001', status: 'PENDING_SUBMIT', submittedAtUtc: null },
+        { ...validOrder, qty: 0 },
+        { clientOrderId: 'bad' },
+      ],
       databaseConfigured: true,
     },
   })
 
   assert.equal(result.health.state, 'ready')
   assert.equal(result.overview.state, 'ready')
+  assert.equal(result.health.value.databaseReachable, false)
   assert.equal(resolveTradingState(result.health.value, result.overview.value), 'HALTED_MANUAL')
   assert.equal(resolvePaperSwitchArmed(result.health.value, result.overview.value), true)
+  assert.equal(resolvePaperExecutionConfigured(result.health.value, result.overview.value), false)
   assert.equal(resolveOrderExecution(result.health.value, result.overview.value), false)
-  assert.equal(result.overview.value.counts.ordersTotal, 2)
+  assert.equal(result.overview.value.counts.ordersTotal, 3)
   assert.equal(result.overview.value.counts.ordersSubmitted, 1)
+  assert.equal(result.overview.value.counts.ordersPending, 1)
   assert.equal(result.orders.state, 'ready')
-  assert.equal(result.orders.value.items.length, 1)
+  assert.equal(result.orders.value.items.length, 2)
   assert.equal(result.orders.value.dropped, 2)
   assert.equal(result.orders.value.items[0].symbol, 'NVDA')
   assert.equal(result.orders.value.items[0].limitPrice, 125)
+  assert.equal(result.orders.value.items[1].status, 'PENDING_SUBMIT')
+  assert.equal(result.orders.value.items[1].submittedAtUtc, null)
   assert.equal(decodeOrder({ ...validOrder, qty: -1 }), null)
 })
 

@@ -108,6 +108,7 @@ internal static class TelemetryEndpoints
                         shadowBlocked = 0,
                         ordersTotal = 0,
                         ordersSubmitted = 0,
+                        ordersPending = 0,
                         ordersRejected = 0,
                         cachedQuotes = quotes.Length,
                         quotes = quotes.Length,
@@ -128,9 +129,10 @@ internal static class TelemetryEndpoints
             var shadowApprovedCount = await db.RiskEvaluations.CountAsync(r => r.Approved, ct);
             var shadowBlockedCount = riskEvaluatedCount - shadowApprovedCount;
             var ordersTotalCount = await db.Orders.CountAsync(ct);
+            var ordersPendingCount = await db.Orders.CountAsync(o => o.Status == "PENDING_SUBMIT", ct);
             var ordersRejectedCount = await db.Orders.CountAsync(
                 o => o.Status == "REJECTED_PREFLIGHT" || o.Status == "FAILED_BROKER", ct);
-            var ordersSubmittedCount = ordersTotalCount - ordersRejectedCount;
+            var ordersSubmittedCount = ordersTotalCount - ordersRejectedCount - ordersPendingCount;
             var calendarCutoffStart = now.AddDays(-1);
             var calendarCutoffEnd = now.AddDays(14);
             var upcomingCalendarCount = await db.ScheduledEvents.CountAsync(
@@ -162,6 +164,7 @@ internal static class TelemetryEndpoints
                     shadowBlocked = shadowBlockedCount,
                     ordersTotal = ordersTotalCount,
                     ordersSubmitted = ordersSubmittedCount,
+                    ordersPending = ordersPendingCount,
                     ordersRejected = ordersRejectedCount,
                     cachedQuotes = quotes.Length,
                     quotes = quotes.Length,
@@ -463,28 +466,32 @@ internal static class TelemetryEndpoints
         var rows = await db.Orders.AsNoTracking()
             .OrderByDescending(o => o.UpdatedAtUtc)
             .ThenByDescending(o => o.SubmittedAtUtc)
-            .ThenByDescending(o => o.ClientOrderId)
+            .ThenBy(o => o.ClientOrderId)
             .Take(limit)
             .ToArrayAsync(ct);
 
-        return rows.Select(static o => (object)new
+        return rows.Select(static o =>
         {
-            clientOrderId = o.ClientOrderId,
-            alpacaOrderId = o.AlpacaOrderId,
-            proposalId = o.ProposalId,
-            symbol = o.Ticker,
-            ticker = o.Ticker,
-            side = o.Side,
-            orderType = o.OrderType,
-            qty = o.Qty,
-            quantity = o.Qty,
-            limitPrice = o.LimitPrice,
-            stopLossPrice = o.StopLossPrice,
-            takeProfitPrice = o.TakeProfitPrice,
-            status = o.Status,
-            filledAvgPrice = o.FilledAvgPrice,
-            submittedAtUtc = o.SubmittedAtUtc,
-            updatedAtUtc = o.UpdatedAtUtc
+            var isSubmitted = o.Status is not ("PENDING_SUBMIT" or "REJECTED_PREFLIGHT" or "FAILED_BROKER");
+            return (object)new
+            {
+                clientOrderId = o.ClientOrderId,
+                alpacaOrderId = o.AlpacaOrderId,
+                proposalId = o.ProposalId,
+                symbol = o.Ticker,
+                ticker = o.Ticker,
+                side = o.Side,
+                orderType = o.OrderType,
+                qty = o.Qty,
+                quantity = o.Qty,
+                limitPrice = o.LimitPrice,
+                stopLossPrice = o.StopLossPrice,
+                takeProfitPrice = o.TakeProfitPrice,
+                status = o.Status,
+                filledAvgPrice = o.FilledAvgPrice,
+                submittedAtUtc = isSubmitted ? (DateTimeOffset?)o.SubmittedAtUtc : null,
+                updatedAtUtc = o.UpdatedAtUtc
+            };
         }).ToArray();
     }
 

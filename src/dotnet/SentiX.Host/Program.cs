@@ -77,6 +77,10 @@ builder.Services.AddSingleton<ITradingStateStore>(services =>
 builder.Services.AddSingleton<ITradingStateProvider>(services => services.GetRequiredService<ITradingStateStore>());
 builder.Services.AddSentiXPaperExecution(builder.Configuration);
 
+builder.Services.AddSingleton<IPaperOrderAuditStore>(services => new EfCorePaperOrderAuditStore(
+    services.GetRequiredService<IDbContextFactory<SentiXDbContext>>(),
+    services.GetRequiredService<ILogger<EfCorePaperOrderAuditStore>>()));
+
 builder.Services.AddSingleton<IMarketEventPipeline>(services => new MarketEventPipeline(
     services.GetRequiredService<IDbContextFactory<SentiXDbContext>>(),
     services.GetRequiredService<NativeBridgeClient>(),
@@ -87,7 +91,9 @@ builder.Services.AddSingleton<IMarketEventPipeline>(services => new MarketEventP
     services.GetRequiredService<UniverseConfig>(),
     services.GetRequiredService<TimeProvider>(),
     services.GetRequiredService<IPaperExecutionEngine>(),
-    services.GetRequiredService<AlpacaPaperOptions>()));
+    services.GetRequiredService<AlpacaPaperOptions>(),
+    services.GetRequiredService<IPaperPortfolioSnapshotProvider>(),
+    services.GetRequiredService<IPaperOrderAuditStore>()));
 
 builder.Services.AddSingleton(services =>
 {

@@ -3,6 +3,7 @@ import {
   postKillSwitchAction,
   readTelemetry,
   resolveOrderExecution,
+  resolvePaperExecutionConfigured,
   resolvePaperSwitchArmed,
   resolveTradingState,
   type Debate,
@@ -35,11 +36,25 @@ function formatTradingStateLabel(state: string | null) {
 
 function orderStatusClass(status: string) {
   const normalized = status.toUpperCase()
-  if (normalized === 'REJECTED_PREFLIGHT' || normalized === 'FAILED_BROKER' || normalized === 'CANCELED' || normalized === 'REJECTED') {
+  if (normalized.startsWith('REJECTED') || normalized.startsWith('FAILED')) {
     return 'tag danger'
   }
-  if (normalized === 'DUPLICATE') return 'tag warning'
-  return 'tag ready'
+  if (normalized === 'PENDING_SUBMIT' || normalized === 'DUPLICATE') {
+    return 'tag warning'
+  }
+  if (normalized === 'EXPIRED' || normalized === 'CANCELED' || normalized === 'CANCELLED') {
+    return 'tag'
+  }
+  if (
+    normalized === 'SUBMITTED' ||
+    normalized === 'NEW' ||
+    normalized === 'ACCEPTED' ||
+    normalized === 'PARTIALLY_FILLED' ||
+    normalized === 'FILLED'
+  ) {
+    return 'tag ready'
+  }
+  return 'tag'
 }
 
 function UtcTime({ value }: { value: string }) {
@@ -195,8 +210,14 @@ export default function App() {
   const orderExecution = resolveOrderExecution(health, overview)
   const tradingState = resolveTradingState(health, overview)
   const paperSwitchArmed = resolvePaperSwitchArmed(health, overview)
+  const paperExecutionConfigured = resolvePaperExecutionConfigured(health, overview)
   const isHalted = Boolean(tradingState?.startsWith('HALTED'))
-  const controlsAvailable = Boolean(health) && overview?.databaseConfigured !== false
+  const databaseUnreachable = Boolean(health) && (tradingState === 'UNAVAILABLE' || health?.databaseReachable === false)
+  const controlsAvailable =
+    Boolean(health) &&
+    overview?.databaseConfigured !== false &&
+    tradingState !== 'UNAVAILABLE' &&
+    health?.databaseReachable !== false
 
   useEffect(() => {
     if (tradingState !== 'HALTED_MANUAL') {
@@ -207,23 +228,29 @@ export default function App() {
   async function handleKillSwitch(action: 'halt' | 'resume') {
     setActionPending(action)
     setActionError(null)
-    const result = await postKillSwitchAction(action, AbortSignal.timeout(5000))
-    setActionPending(null)
-    setConfirmingResume(false)
-    if (!result.ok) {
-      const message = result.error === 'cannot_resume_state'
-        ? `Manual resume blocked while trading state is ${readableStatus(result.tradingState ?? 'halted')}.`
-        : result.error === 'database_not_configured'
-          ? 'PostgreSQL is not configured on the host.'
-          : `Kill-switch ${action} failed (${readableStatus(result.error)}).`
-      setActionError(message)
+    try {
+      const result = await postKillSwitchAction(action, AbortSignal.timeout(5000))
+      setConfirmingResume(false)
+      if (!result.ok) {
+        const message = result.error === 'cannot_resume_state'
+          ? `Manual resume blocked while trading state is ${readableStatus(result.tradingState ?? 'halted')}.`
+          : result.error === 'database_not_configured'
+            ? 'PostgreSQL is not configured on the host.'
+            : `Kill-switch ${action} failed (${readableStatus(result.error)}).`
+        setActionError(message)
+      }
+      await refreshNow()
+    } finally {
+      setActionPending(null)
     }
-    await refreshNow()
   }
 
   let executionBadgeClass = 'tag'
   let executionBadgeText = 'Disabled (Shadow Only)'
-  if (paperSwitchArmed === true && tradingState === 'ACTIVE') {
+  if (paperSwitchArmed === true && paperExecutionConfigured === false) {
+    executionBadgeClass = 'tag danger'
+    executionBadgeText = 'Paper Switch Armed · Credentials Missing (Fail-Closed)'
+  } else if (paperSwitchArmed === true && tradingState === 'ACTIVE') {
     executionBadgeClass = 'tag warning'
     executionBadgeText = 'Paper Armed (paper-api.alpaca.markets)'
   } else if (paperSwitchArmed === true) {
@@ -286,6 +313,12 @@ export default function App() {
             </div>
           </dl>
 
+          {databaseUnreachable && (
+            <p className="safety-alert" role="alert">
+              PostgreSQL is unreachable — trading state cannot be verified and paper execution is blocked fail-closed.
+            </p>
+          )}
+
           {isHalted && tradingState && (
             <div className="safety-alert" role="alert">
               <strong>Kill-Switch Engaged · {readableStatus(tradingState)}</strong>
@@ -293,7 +326,7 @@ export default function App() {
             </div>
           )}
 
-          {paperSwitchArmed === true && tradingState === 'ACTIVE' && (
+          {paperSwitchArmed === true && paperExecutionConfigured !== false && tradingState === 'ACTIVE' && (
             <p className="paper-armed-notice" role="status">
               Paper Armed (paper-api.alpaca.markets) — HardRiskManager-approved proposals dispatch Long-Only whole-share bracket orders to Alpaca Paper API.
             </p>

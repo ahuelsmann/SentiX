@@ -34,6 +34,12 @@ public static class ExecutionServiceCollectionExtensions
                 AllowAutoRedirect = false
             });
 
+        services.AddHttpClient<IPaperPortfolioSnapshotProvider, AlpacaPaperPortfolioSnapshotProvider>()
+            .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+            {
+                AllowAutoRedirect = false
+            });
+
         services.TryAddSingleton<IPaperExecutionEngine>(sp => new PaperExecutionEngine(
             sp.GetRequiredService<AlpacaPaperOptions>(),
             sp.GetRequiredService<ITradingStateProvider>(),

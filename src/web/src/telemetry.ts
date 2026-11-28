@@ -6,6 +6,7 @@ export type Health = {
   tradingState: string | null
   paperSwitchArmed: boolean | null
   paperExecutionConfigured: boolean | null
+  databaseReachable?: boolean
 }
 
 export type Overview = {
@@ -25,6 +26,7 @@ export type Overview = {
     riskApproved: number | null
     ordersTotal: number | null
     ordersSubmitted: number | null
+    ordersPending: number | null
     ordersRejected: number | null
     cachedQuotes: number | null
     upcomingCalendar: number | null
@@ -141,6 +143,11 @@ export function resolvePaperSwitchArmed(health?: Health | null, overview?: Overv
   return overview?.paperSwitchArmed ?? health?.paperSwitchArmed ?? null
 }
 
+export function resolvePaperExecutionConfigured(health?: Health | null, overview?: Overview | null): boolean | null {
+  if (health?.paperExecutionConfigured === false || overview?.paperExecutionConfigured === false) return false
+  return overview?.paperExecutionConfigured ?? health?.paperExecutionConfigured ?? null
+}
+
 function decodeHealth(value: unknown): Health | null {
   if (!isRecord(value)) return null
   const status = text(value.status)
@@ -155,6 +162,7 @@ function decodeHealth(value: unknown): Health | null {
     tradingState: text(value.tradingState),
     paperSwitchArmed: readBoolean(value.paperSwitchArmed),
     paperExecutionConfigured: readBoolean(value.paperExecutionConfigured),
+    databaseReachable: typeof value.databaseReachable === 'boolean' ? value.databaseReachable : undefined,
   }
 }
 
@@ -183,6 +191,7 @@ function decodeOverview(value: unknown): Overview | null {
       riskApproved: finite(counts.riskApproved ?? counts.shadowApproved),
       ordersTotal: finite(counts.ordersTotal),
       ordersSubmitted: finite(counts.ordersSubmitted),
+      ordersPending: finite(counts.ordersPending),
       ordersRejected: finite(counts.ordersRejected),
       cachedQuotes: finite(counts.cachedQuotes ?? counts.quotes),
       upcomingCalendar: finite(counts.upcomingCalendar ?? counts.scheduledEvents),

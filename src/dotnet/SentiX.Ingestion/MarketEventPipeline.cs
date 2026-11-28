@@ -11,6 +11,7 @@ using SentiX.Risk;
 using RiskProposal = SentiX.Risk.TradeProposal;
 using RiskTradeAction = SentiX.Risk.TradeAction;
 using RiskInstrumentType = SentiX.Risk.InstrumentType;
+using TradingState = SentiX.Risk.TradingState;
 using DomainTradeAction = SentiX.Domain.TradeAction;
 using DomainInstrumentType = SentiX.Domain.InstrumentType;
 
@@ -34,10 +35,14 @@ public sealed class MarketEventPipeline(
     UniverseConfig? universe = null,
     TimeProvider? timeProvider = null,
     IPaperExecutionEngine? paperExecution = null,
-    AlpacaPaperOptions? paperOptions = null) : IMarketEventPipeline, IDisposable
+    AlpacaPaperOptions? paperOptions = null,
+    IPaperPortfolioSnapshotProvider? paperPortfolioProvider = null,
+    IPaperOrderAuditStore? orderAuditStore = null) : IMarketEventPipeline, IDisposable
 {
+    private static readonly TimeSpan LocalOrderHistoryWindow = TimeSpan.FromHours(48);
     private readonly SemaphoreSlim migration = new(1, 1);
     private readonly TimeProvider clock = timeProvider ?? TimeProvider.System;
+    private readonly IPaperOrderAuditStore auditStore = orderAuditStore ?? new EfCorePaperOrderAuditStore(dbFactory, logger);
     private volatile bool migrated;
 
     public bool IsConfigured { get; } = isConfigured;
@@ -185,8 +190,50 @@ public sealed class MarketEventPipeline(
             .SingleOrDefaultAsync(token);
         var tradingState = ParsePersistedTradingState(persistedTradingState);
 
-        var (riskProposal, entryPrice, riskDecision) = EvaluateHardRiskWithInputs(
-            proposal, ticker, quoteCache, universe, tradingState, evaluatedAtUtc);
+        var isArmedPaperMode = paperOptions is { TradingEnabled: true };
+        RiskProposal riskProposal;
+        decimal entryPrice;
+        RiskDecision? riskDecision;
+        int openLongQuantity = 0;
+
+        if (!isArmedPaperMode)
+        {
+            // Shadow Mode strictly uses the synthetic $100k empty portfolio with zero broker HTTP calls.
+            (riskProposal, entryPrice, riskDecision) = EvaluateHardRiskWithInputs(
+                proposal, ticker, quoteCache, universe, tradingState, evaluatedAtUtc);
+        }
+        else
+        {
+            var armedEval = await EvaluateArmedPaperRiskAsync(proposal, ticker, tradingState, evaluatedAtUtc, token);
+            if (!armedEval.SnapshotAvailable)
+            {
+                // Fail closed: NEVER fall back to synthetic $100k portfolio when TradingEnabled == true!
+                var unavailableViolationsJson = JsonSerializer.Serialize(
+                    new[] { new { code = "PAPER_PORTFOLIO_UNAVAILABLE", message = armedEval.FailureReason ?? "Authoritative paper portfolio snapshot is unavailable." } },
+                    SentiXJson.Options);
+
+                db.DecisionDebates.Add(debateRow);
+                db.RiskEvaluations.Add(new RiskEvaluationRow(
+                    0,
+                    proposal.ProposalId,
+                    Approved: false,
+                    PersistedTradingStateFormat.ToDatabaseValue(TradingState.HaltedSystemError),
+                    unavailableViolationsJson,
+                    CalculatedQty: 0,
+                    ClampedSlPct: null,
+                    ClampedTpPct: null,
+                    ClientOrderId: null,
+                    evaluatedAtUtc));
+                await db.SaveChangesAsync(token);
+                return;
+            }
+
+            riskProposal = armedEval.Proposal!;
+            entryPrice = armedEval.EntryPrice;
+            riskDecision = armedEval.Decision!;
+            openLongQuantity = armedEval.OpenLongQuantity;
+        }
+
         var violationsJson = JsonSerializer.Serialize(
             riskDecision.Violations.Select(static v => new { code = v.Code.ToString(), message = v.Message }),
             SentiXJson.Options);
@@ -207,61 +254,179 @@ public sealed class MarketEventPipeline(
         db.RiskEvaluations.Add(riskRow);
         await db.SaveChangesAsync(token);
 
-        if (paperExecution is not null &&
-            paperOptions is { TradingEnabled: true } &&
+        if (isArmedPaperMode &&
+            paperExecution is not null &&
             riskDecision.Approved &&
             proposal.Action != DomainTradeAction.Hold &&
             !string.IsNullOrWhiteSpace(riskDecision.ClientOrderId) &&
             !string.IsNullOrWhiteSpace(ticker))
         {
-            await ExecuteAndPersistPaperOrderAsync(
+            await ExecuteAndPersistPaperOrderWithWriteAheadAsync(
                 proposal.ProposalId,
                 ticker,
                 proposal.Action,
                 riskProposal,
                 riskDecision,
                 entryPrice,
+                openLongQuantity,
+                auditStore,
+                paperExecution,
+                clock,
+                logger,
                 token);
         }
     }
 
-    private async Task ExecuteAndPersistPaperOrderAsync(
+    internal async Task<(bool SnapshotAvailable, string? FailureReason, RiskProposal? Proposal, decimal EntryPrice, RiskDecision? Decision, int OpenLongQuantity)>
+        EvaluateArmedPaperRiskAsync(
+            SentiX.Domain.TradeProposal proposal,
+            string? normalizedTicker,
+            TradingState tradingState,
+            DateTimeOffset evaluatedAtUtc,
+            CancellationToken token)
+    {
+        if (paperPortfolioProvider is null)
+        {
+            return (false, "Authoritative paper portfolio snapshot provider is not registered.", null, 0m, null, 0);
+        }
+
+        var accountResult = await paperPortfolioProvider.GetSnapshotAsync(universe, token);
+        if (!accountResult.IsSuccess || accountResult.Snapshot is null)
+        {
+            logger.LogWarning(
+                "Armed paper risk evaluation failed closed because Alpaca paper portfolio snapshot failed ({Code}): {Reason}",
+                accountResult.FailureCode,
+                accountResult.FailureReason);
+            return (false, accountResult.FailureReason ?? "Failed to fetch authoritative Alpaca Paper account snapshot.", null, 0m, null, 0);
+        }
+
+        var recentOrdersResult = await auditStore.GetRecentOrdersAsync(evaluatedAtUtc - LocalOrderHistoryWindow, token);
+        if (!recentOrdersResult.IsSuccess)
+        {
+            return (false, recentOrdersResult.ErrorReason ?? "Failed to read local orders history for cooldown/pending checks.", null, 0m, null, 0);
+        }
+
+        var (riskProposal, entryPrice, decision, openLongQty) = EvaluateArmedHardRiskFromSnapshots(
+            proposal,
+            normalizedTicker,
+            quoteCache,
+            universe,
+            tradingState,
+            accountResult.Snapshot,
+            recentOrdersResult.Orders,
+            evaluatedAtUtc);
+
+        return (true, null, riskProposal, entryPrice, decision, openLongQty);
+    }
+
+    internal static (RiskProposal Proposal, decimal EntryPrice, RiskDecision Decision, int OpenLongQuantity)
+        EvaluateArmedHardRiskFromSnapshots(
+            SentiX.Domain.TradeProposal proposal,
+            string? normalizedTicker,
+            IMarketQuoteCache? quoteCache,
+            UniverseConfig? universe,
+            TradingState tradingState,
+            PaperAccountSnapshot accountSnapshot,
+            IReadOnlyList<OrderRow> recentLocalOrders,
+            DateTimeOffset nowUtc)
+    {
+        var riskProposal = ToRiskProposal(proposal, normalizedTicker);
+        var askPrice = ResolveAskPrice(normalizedTicker, quoteCache);
+        var targetSector = AlpacaPaperPortfolioSnapshotProvider.ResolveSector(normalizedTicker ?? string.Empty, universe);
+        var allowedTickers = universe?.EquitiesSymbols.ToHashSet(StringComparer.OrdinalIgnoreCase)
+            ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var mergedPending = new Dictionary<string, PendingOrder>(StringComparer.Ordinal);
+        foreach (var brokerOrder in accountSnapshot.PendingOrders)
+        {
+            mergedPending[brokerOrder.ClientOrderId] = brokerOrder;
+        }
+
+        var lastTradeTimes = new Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase);
+        foreach (var localOrder in recentLocalOrders)
+        {
+            var status = localOrder.Status?.Trim().ToUpperInvariant() ?? string.Empty;
+            if (status == "PENDING_SUBMIT" && !mergedPending.ContainsKey(localOrder.ClientOrderId))
+            {
+                var pendingSide = string.Equals(localOrder.Side, "SELL", StringComparison.OrdinalIgnoreCase)
+                    ? RiskTradeAction.Sell
+                    : RiskTradeAction.Buy;
+                mergedPending[localOrder.ClientOrderId] = new PendingOrder(
+                    localOrder.ClientOrderId,
+                    localOrder.Ticker,
+                    pendingSide,
+                    Math.Max(1, localOrder.Qty));
+            }
+
+            if (status is not ("REJECTED_PREFLIGHT" or "FAILED_BROKER") && !string.IsNullOrWhiteSpace(localOrder.Ticker))
+            {
+                var tradeTime = localOrder.SubmittedAtUtc >= localOrder.UpdatedAtUtc
+                    ? localOrder.SubmittedAtUtc
+                    : localOrder.UpdatedAtUtc;
+                if (!lastTradeTimes.TryGetValue(localOrder.Ticker, out var existingTime) || tradeTime > existingTime)
+                {
+                    lastTradeTimes[localOrder.Ticker] = tradeTime;
+                }
+            }
+        }
+
+        var openLongQty = accountSnapshot.OpenPositions
+            .Where(p => p.Quantity > 0 && string.Equals(p.Ticker, normalizedTicker, StringComparison.OrdinalIgnoreCase))
+            .Sum(p => p.Quantity);
+
+        var authoritativePortfolio = new PortfolioSnapshot(
+            tradingState,
+            accountSnapshot.Equity,
+            accountSnapshot.BuyingPower,
+            accountSnapshot.DailyPnLPct,
+            askPrice,
+            targetSector,
+            accountSnapshot.OpenPositions,
+            mergedPending.Values.ToArray(),
+            lastTradeTimes);
+
+        var policy = new RiskPolicy { AllowedTickers = allowedTickers };
+        var decision = HardRiskManager.Evaluate(riskProposal, authoritativePortfolio, new MarketClock(nowUtc), policy);
+        return (riskProposal, askPrice, decision, openLongQty);
+    }
+
+    internal static async Task ExecuteAndPersistPaperOrderWithWriteAheadAsync(
         string proposalId,
         string normalizedTicker,
         DomainTradeAction action,
         RiskProposal riskProposal,
         RiskDecision riskDecision,
         decimal entryPrice,
+        int openLongQuantity,
+        IPaperOrderAuditStore orderAuditStore,
+        IPaperExecutionEngine executionEngine,
+        TimeProvider clock,
+        ILogger logger,
         CancellationToken token)
     {
-        var expectedClientOrderId = riskDecision.ClientOrderId!;
-        try
+        var baseRequest = PaperOrderExecutionRequest.FromRiskDecision(riskProposal, riskDecision, entryPrice);
+        var execRequest = action == DomainTradeAction.Sell && openLongQuantity > 0
+            ? baseRequest with { IsClosingLongPosition = true, OpenLongQuantity = openLongQuantity }
+            : baseRequest;
+
+        var intentTimestampUtc = clock.GetUtcNow();
+        var pendingIntentRow = BuildPendingSubmitRow(
+            proposalId,
+            normalizedTicker,
+            action,
+            execRequest,
+            intentTimestampUtc);
+
+        var disposition = await orderAuditStore.TryBeginOrderIntentAsync(pendingIntentRow, token);
+        if (disposition != OrderIntentDisposition.ProceedToSubmit)
         {
-            await using var preCheckDb = await dbFactory.CreateDbContextAsync(token);
-            if (await preCheckDb.Orders.AsNoTracking().AnyAsync(o => o.ClientOrderId == expectedClientOrderId, token))
-            {
-                return;
-            }
-        }
-        catch (OperationCanceledException) when (token.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            logger.LogWarning(
-                "Skipping paper execution because pre-execution orders idempotency check failed for {ClientOrderId} ({ErrorType}).",
-                expectedClientOrderId,
-                ex.GetType().Name);
             return;
         }
 
-        PaperOrderExecutionRequest execRequest;
         PaperExecutionResult execResult;
         try
         {
-            execRequest = PaperOrderExecutionRequest.FromRiskDecision(riskProposal, riskDecision, entryPrice);
-            execResult = await paperExecution!.ExecuteAsync(execRequest, token);
+            execResult = await executionEngine.ExecuteAsync(execRequest, token);
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
@@ -270,14 +435,22 @@ public sealed class MarketEventPipeline(
         catch (Exception ex)
         {
             logger.LogWarning(
-                "Paper order execution failed unexpectedly for ProposalId={ProposalId}, ClientOrderId={ClientOrderId} ({ErrorType}).",
+                "Paper order execution threw unexpectedly for ProposalId={ProposalId}, ClientOrderId={ClientOrderId} ({ErrorType}).",
                 proposalId,
-                expectedClientOrderId,
+                pendingIntentRow.ClientOrderId,
                 ex.GetType().Name);
-            return;
+            execResult = new PaperExecutionResult(
+                ExecutionOutcomeStatus.FailedBroker,
+                ExecutionRejectionCode.BrokerNetworkError,
+                $"Unexpected execution exception ({ex.GetType().Name}).",
+                pendingIntentRow.ClientOrderId,
+                TradingState.HaltedSystemError,
+                Receipt: null,
+                BrokerResult: null,
+                EvaluatedAtUtc: clock.GetUtcNow());
         }
 
-        var orderRow = MapOrderRow(
+        var completedRow = MapOrderRow(
             proposalId,
             normalizedTicker,
             action,
@@ -285,30 +458,33 @@ public sealed class MarketEventPipeline(
             execResult,
             clock.GetUtcNow());
 
-        try
-        {
-            await using var orderDb = await dbFactory.CreateDbContextAsync(token);
-            var exists = await orderDb.Orders.AsNoTracking()
-                .AnyAsync(o => o.ClientOrderId == orderRow.ClientOrderId, token);
-            if (!exists)
-            {
-                orderDb.Orders.Add(orderRow);
-                await orderDb.SaveChangesAsync(token);
-            }
-        }
-        catch (OperationCanceledException) when (token.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            logger.LogWarning(
-                "Failed to persist paper order audit row for ProposalId={ProposalId}, ClientOrderId={ClientOrderId}, Status={Status} ({ErrorType}).",
-                proposalId,
-                orderRow.ClientOrderId,
-                orderRow.Status,
-                ex.GetType().Name);
-        }
+        await orderAuditStore.CompleteOrderIntentAsync(completedRow);
+    }
+
+    internal static OrderRow BuildPendingSubmitRow(
+        string proposalId,
+        string normalizedTicker,
+        DomainTradeAction action,
+        PaperOrderExecutionRequest request,
+        DateTimeOffset nowUtc)
+    {
+        var side = action == DomainTradeAction.Buy ? "BUY" : "SELL";
+        var orderType = request.OrderType == ExecutionOrderType.Market ? "MARKET" : "LIMIT";
+        return new OrderRow(
+            request.RiskDecision.ClientOrderId!,
+            AlpacaOrderId: null,
+            proposalId,
+            normalizedTicker,
+            side,
+            orderType,
+            request.RiskDecision.CalculatedQuantity,
+            request.LimitPrice,
+            request.StopLossPrice,
+            request.TakeProfitPrice,
+            Status: "PENDING_SUBMIT",
+            FilledAvgPrice: null,
+            SubmittedAtUtc: nowUtc,
+            UpdatedAtUtc: nowUtc);
     }
 
     internal static OrderRow MapOrderRow(
@@ -381,42 +557,9 @@ public sealed class MarketEventPipeline(
         SentiX.Risk.TradingState tradingState,
         DateTimeOffset nowUtc)
     {
-        var riskAction = proposal.Action switch
-        {
-            DomainTradeAction.Buy => RiskTradeAction.Buy,
-            DomainTradeAction.Sell => RiskTradeAction.Sell,
-            _ => RiskTradeAction.Hold
-        };
-        var riskInstrument = proposal.InstrumentType == DomainInstrumentType.SectorEtf
-            ? RiskInstrumentType.SectorEtf
-            : RiskInstrumentType.Equity;
-
-        var riskProposal = new RiskProposal(
-            proposal.ProposalId,
-            proposal.EventId,
-            riskAction,
-            normalizedTicker ?? string.Empty,
-            riskInstrument,
-            proposal.Confidence,
-            proposal.ExpectedHorizonHours,
-            proposal.SuggestedStopLossPct,
-            proposal.SuggestedTakeProfitPct,
-            proposal.Rationale,
-            proposal.DissentSummary);
-
-        MarketQuoteSnapshot? tickerQuote = null;
-        if (!string.IsNullOrWhiteSpace(normalizedTicker) && quoteCache is not null)
-        {
-            quoteCache.TryGet(normalizedTicker, out tickerQuote);
-        }
-
-        var askPrice = tickerQuote is { AskPrice: > 0m } ? tickerQuote.AskPrice :
-            tickerQuote is { MidPrice: > 0m } ? tickerQuote.MidPrice : 0m;
-
-        var targetSector = universe?.Watchlist
-            .FirstOrDefault(e => string.Equals(e.Ticker, normalizedTicker, StringComparison.OrdinalIgnoreCase))
-            ?.Sector ?? "ETF";
-
+        var riskProposal = ToRiskProposal(proposal, normalizedTicker);
+        var askPrice = ResolveAskPrice(normalizedTicker, quoteCache);
+        var targetSector = AlpacaPaperPortfolioSnapshotProvider.ResolveSector(normalizedTicker ?? string.Empty, universe);
         var allowedTickers = universe?.EquitiesSymbols.ToHashSet(StringComparer.OrdinalIgnoreCase)
             ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -434,6 +577,44 @@ public sealed class MarketEventPipeline(
         var policy = new RiskPolicy { AllowedTickers = allowedTickers };
         var decision = HardRiskManager.Evaluate(riskProposal, shadowPortfolio, new MarketClock(nowUtc), policy);
         return (riskProposal, askPrice, decision);
+    }
+
+    private static RiskProposal ToRiskProposal(SentiX.Domain.TradeProposal proposal, string? normalizedTicker)
+    {
+        var riskAction = proposal.Action switch
+        {
+            DomainTradeAction.Buy => RiskTradeAction.Buy,
+            DomainTradeAction.Sell => RiskTradeAction.Sell,
+            _ => RiskTradeAction.Hold
+        };
+        var riskInstrument = proposal.InstrumentType == DomainInstrumentType.SectorEtf
+            ? RiskInstrumentType.SectorEtf
+            : RiskInstrumentType.Equity;
+
+        return new RiskProposal(
+            proposal.ProposalId,
+            proposal.EventId,
+            riskAction,
+            normalizedTicker ?? string.Empty,
+            riskInstrument,
+            proposal.Confidence,
+            proposal.ExpectedHorizonHours,
+            proposal.SuggestedStopLossPct,
+            proposal.SuggestedTakeProfitPct,
+            proposal.Rationale,
+            proposal.DissentSummary);
+    }
+
+    private static decimal ResolveAskPrice(string? normalizedTicker, IMarketQuoteCache? quoteCache)
+    {
+        MarketQuoteSnapshot? tickerQuote = null;
+        if (!string.IsNullOrWhiteSpace(normalizedTicker) && quoteCache is not null)
+        {
+            quoteCache.TryGet(normalizedTicker, out tickerQuote);
+        }
+
+        return tickerQuote is { AskPrice: > 0m } ? tickerQuote.AskPrice :
+            tickerQuote is { MidPrice: > 0m } ? tickerQuote.MidPrice : 0m;
     }
 
     public void Dispose() => migration.Dispose();
