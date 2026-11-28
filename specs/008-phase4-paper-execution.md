@@ -56,3 +56,44 @@
   - Enforces all pre-flight safety invariants in deterministic order before calling `IAlpacaPaperBrokerClient`.
 - **`ExecutionServiceCollectionExtensions`:**
   - `AddSentiXPaperExecution(IConfiguration)` registers `AlpacaPaperOptions`, `ITradingStateProvider` (default fail-closed `HaltedSystemError` unless a persisted provider is registered), `IAlpacaPaperBrokerClient` with `AllowAutoRedirect = false`, and `IPaperExecutionEngine` / `PaperExecutionEngine`.
+
+## 3. Host Wiring, Persisted Kill-Switch & Cockpit Contract (`T-14`)
+
+### 3.1 Persisted Kill-Switch Store (`ITradingStateStore` / `EfCoreTradingStateStore`)
+- `ITradingStateStore` extends `ITradingStateProvider` (`GetCurrentStateAsync` / `ReadTradingStateAsync`) and adds operator transition operations (`HaltManualAsync`, `ResumeManualAsync`) backed by PostgreSQL `system_state` (`id = 1`, Spec 005).
+- **Fail-Closed State Reads:**
+  - Queries `system_state` (`id == 1`, `AsNoTracking()`).
+  - Valid persisted strings (`"ACTIVE"`, `"HALTED_MANUAL"`, `"HALTED_DAILY_LOSS"`, `"HALTED_SYSTEM_ERROR"`) return `TradingStateReadResult(Success: true, State: ...)`.
+  - Missing row (`id = 1`), empty/unknown string, unconfigured database (`UnconfiguredTradingStateStore`), or database exception returns `TradingStateReadResult(Success: false, State: TradingState.HaltedSystemError, ErrorReason: ...)` without throwing unhandled exceptions.
+- **Operator State Transitions:**
+  - `HaltManualAsync(updatedBy, ct)`: Sanitizes `updatedBy` (trimmed, non-empty, `<= 64` chars) and atomically upserts `system_state (id = 1)` to `trading_state = 'HALTED_MANUAL'`, `updated_at_utc = clock.GetUtcNow()`. Emergency manual halt is permitted from **any** state whenever PostgreSQL is reachable.
+  - `ResumeManualAsync(updatedBy, ct)`: Atomically transitions `system_state (id = 1)` to `'ACTIVE'` **only** when `trading_state` is `'HALTED_MANUAL'` (or idempotently `'ACTIVE'`). If `trading_state` is `'HALTED_DAILY_LOSS'`, `'HALTED_SYSTEM_ERROR'`, missing, or unknown, it fails closed with `CannotResumeNonManualHalt` (`409 Conflict`) so an operator UI click can never bypass a daily-loss circuit breaker or system-error halt.
+
+### 3.2 Startup Database Readiness (`DatabaseStartupInitializer`)
+- `SentiX.Host` registers a startup `IHostedService` ahead of market collectors that invokes `IMarketEventPipeline.EnsureReadyAsync` when `ConnectionStrings:Default` is configured.
+- Applies EF Core migrations and seeds `system_state (id = 1, 'ACTIVE')` on fresh PostgreSQL 17 deployments (`docker compose up`) before `/api/overview` or collector workers run, while catching and logging transient startup connectivity errors without crashing the host process.
+
+### 3.3 `MarketEventPipeline` Phase 4 Order Execution & `orders` Persistence
+- `SentiX.Risk` remains 100 % untouched (`0` changes).
+- After `decision_debates` and `risk_evaluations` are committed in `MarketEventPipeline`:
+  - When `AlpacaPaperOptions.TradingEnabled == false` (default Shadow Mode), zero calls are made to `IPaperExecutionEngine` and zero rows are written to `orders`.
+  - When `AlpacaPaperOptions.TradingEnabled == true`, `riskDecision.Approved == true`, `proposal.Action != HOLD`, and `riskDecision.ClientOrderId` is non-empty, `MarketEventPipeline` constructs `PaperOrderExecutionRequest.FromRiskDecision(...)` using the exact `TradeProposal` and quote `entryPrice` evaluated by `HardRiskManager`.
+  - If `orders` does not already contain `ClientOrderId`, `IPaperExecutionEngine.ExecuteAsync` is invoked and the resulting `OrderRow` is persisted idempotently (`SUBMITTED` / broker status, `DUPLICATE`, `REJECTED_PREFLIGHT`, or `FAILED_BROKER`) in an isolated post-debate unit of work so unexpected persistence errors never roll back or corrupt the committed debate/risk audit trail.
+
+### 3.4 Loopback HTTP Telemetry, Orders & Kill-Switch API (`TelemetryEndpoints`)
+- All endpoints emit `Cache-Control: no-store`.
+- `GET /health` & `GET /api/overview`:
+  - Report `phase = 4`, `tradingState` (`"ACTIVE"`, `"HALTED_MANUAL"`, `"HALTED_DAILY_LOSS"`, `"HALTED_SYSTEM_ERROR"`, or `"UNAVAILABLE"`), `paperSwitchArmed` (`AlpacaPaperOptions.TradingEnabled`), `paperExecutionConfigured` (`AlpacaPaperOptions.IsConfigured`), and effective `tradingEnabled` / `orderExecutionEnabled` (`paperSwitchArmed && tradingState == "ACTIVE"`).
+  - `/api/overview` additionally includes `counts.ordersTotal`, `counts.ordersSubmitted`, `counts.ordersRejected`, and `latestOrders` (newest 10 rows).
+- `GET /api/orders?limit=25`:
+  - Returns `{ items, databaseConfigured }` ordered by `updated_at_utc DESC, submitted_at_utc DESC, client_order_id ASC` (`limit` clamped to `1..100`).
+- `POST /api/system-state/halt` & `POST /api/system-state/resume`:
+  - Reject requests carrying a non-loopback `Origin` header (host other than `localhost` or `127.0.0.1`) with `403 Forbidden` (`{ error = "forbidden_origin" }`).
+  - Require exact ordinal header `X-SentiX-Confirm: HALT` (on `/halt`) or `X-SentiX-Confirm: RESUME` (on `/resume`); missing or mismatched values return `400 Bad Request` (`{ error = "missing_confirmation_header" }`).
+  - Return `503 Service Unavailable` when PostgreSQL is unconfigured (`database_not_configured`) or unreachable (`database_unavailable`).
+  - `/halt` transitions `system_state` to `HALTED_MANUAL` (`200 OK`).
+  - `/resume` transitions `HALTED_MANUAL` (or `ACTIVE`) to `ACTIVE` (`200 OK`), or fails closed with `409 Conflict` (`{ error = "cannot_resume_state", code = "CannotResumeNonManualHalt", tradingState }`) on `HALTED_DAILY_LOSS` / `HALTED_SYSTEM_ERROR`.
+
+### 3.5 Phase 4 Cockpit UI (`src/web`)
+- Displays Phase 4 `Paper & shadow cockpit` status, distinguishing calm default Shadow Mode (`Disabled (Shadow Only)`) from armed paper mode (`Paper Armed (paper-api.alpaca.markets)`) and halted states (`Kill-Switch Engaged`).
+- Provides one-click emergency `Engage Kill-Switch (HALT)` when `ACTIVE`, a two-step `Resume to Active` -> `Confirm Resume` / `Cancel` flow when `HALTED_MANUAL`, a circuit-breaker lock notice when `HALTED_DAILY_LOSS` / `HALTED_SYSTEM_ERROR`, and an accessible `#orders` audit table.

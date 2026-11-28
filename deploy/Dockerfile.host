@@ -10,6 +10,7 @@ FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /source
 COPY src/dotnet/SentiX.Domain/SentiX.Domain.csproj src/dotnet/SentiX.Domain/
 COPY src/dotnet/SentiX.Risk/SentiX.Risk.csproj src/dotnet/SentiX.Risk/
+COPY src/dotnet/SentiX.Execution/SentiX.Execution.csproj src/dotnet/SentiX.Execution/
 COPY src/dotnet/SentiX.DecisionSwarm/SentiX.DecisionSwarm.csproj src/dotnet/SentiX.DecisionSwarm/
 COPY src/dotnet/SentiX.Infrastructure/SentiX.Infrastructure.csproj src/dotnet/SentiX.Infrastructure/
 COPY src/dotnet/SentiX.NativeBridge/SentiX.NativeBridge.csproj src/dotnet/SentiX.NativeBridge/
@@ -19,6 +20,7 @@ COPY config/universe.json config/universe.json
 RUN dotnet restore src/dotnet/SentiX.Host/SentiX.Host.csproj
 COPY src/dotnet/SentiX.Domain/ src/dotnet/SentiX.Domain/
 COPY src/dotnet/SentiX.Risk/ src/dotnet/SentiX.Risk/
+COPY src/dotnet/SentiX.Execution/ src/dotnet/SentiX.Execution/
 COPY src/dotnet/SentiX.DecisionSwarm/ src/dotnet/SentiX.DecisionSwarm/
 COPY src/dotnet/SentiX.Infrastructure/ src/dotnet/SentiX.Infrastructure/
 COPY src/dotnet/SentiX.NativeBridge/ src/dotnet/SentiX.NativeBridge/

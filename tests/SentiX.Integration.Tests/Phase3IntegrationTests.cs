@@ -26,6 +26,10 @@ public sealed class Phase3IntegrationTests
                 ["Sentix:NativeSocketPath"] = Path.Combine(Path.GetTempPath(), $"sx-{Guid.NewGuid():N}.sock"),
                 ["Alpaca:ApiKey"] = "PK_YOUR_PAPER_KEY",
                 ["Alpaca:SecretKey"] = "YOUR_PAPER_SECRET",
+                ["ALPACA_API_KEY"] = "PK_YOUR_PAPER_KEY",
+                ["ALPACA_SECRET_KEY"] = "YOUR_PAPER_SECRET",
+                ["ALPACA_TRADING_ENABLED"] = "false",
+                ["TRADING_ENABLED"] = "false",
                 ["Finnhub:ApiKey"] = "placeholder",
                 ["Sec:UserAgent"] = "disabled"
             })));
@@ -40,7 +44,8 @@ public sealed class Phase3IntegrationTests
         Assert.Equal(HttpStatusCode.OK, overviewRes.StatusCode);
         Assert.True(overviewRes.Headers.CacheControl?.NoStore);
         using var overview = JsonDocument.Parse(await overviewRes.Content.ReadAsStringAsync());
-        Assert.Equal(3, overview.RootElement.GetProperty("phase").GetInt32());
+        Assert.Equal(4, overview.RootElement.GetProperty("phase").GetInt32());
+        Assert.False(overview.RootElement.GetProperty("paperSwitchArmed").GetBoolean());
         Assert.False(overview.RootElement.GetProperty("orderExecutionEnabled").GetBoolean());
         Assert.False(overview.RootElement.GetProperty("databaseConfigured").GetBoolean());
         Assert.Equal(1, overview.RootElement.GetProperty("counts").GetProperty("cachedQuotes").GetInt32());

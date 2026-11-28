@@ -22,6 +22,10 @@ public sealed class HostTests
                 ["Sentix:NativeSocketPath"] = Path.Combine(Path.GetTempPath(), $"sx-{Guid.NewGuid():N}.sock"),
                 ["Alpaca:ApiKey"] = "PK_YOUR_PAPER_KEY",
                 ["Alpaca:SecretKey"] = "YOUR_PAPER_SECRET",
+                ["ALPACA_API_KEY"] = "PK_YOUR_PAPER_KEY",
+                ["ALPACA_SECRET_KEY"] = "YOUR_PAPER_SECRET",
+                ["ALPACA_TRADING_ENABLED"] = "false",
+                ["TRADING_ENABLED"] = "false",
                 ["X:BearerToken"] = "",
                 ["Finnhub:ApiKey"] = "placeholder",
                 ["Sec:UserAgent"] = "disabled"
@@ -34,7 +38,10 @@ public sealed class HostTests
         using var payload = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         Assert.Equal("ok", payload.RootElement.GetProperty("status").GetString());
         Assert.Equal("unavailable", payload.RootElement.GetProperty("native").GetString());
-        Assert.Equal(3, payload.RootElement.GetProperty("phase").GetInt32());
+        Assert.Equal(4, payload.RootElement.GetProperty("phase").GetInt32());
+        Assert.Equal("UNAVAILABLE", payload.RootElement.GetProperty("tradingState").GetString());
+        Assert.False(payload.RootElement.GetProperty("paperSwitchArmed").GetBoolean());
+        Assert.False(payload.RootElement.GetProperty("paperExecutionConfigured").GetBoolean());
         Assert.False(payload.RootElement.GetProperty("tradingEnabled").GetBoolean());
         Assert.False(payload.RootElement.GetProperty("orderExecutionEnabled").GetBoolean());
 

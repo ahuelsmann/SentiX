@@ -1,15 +1,45 @@
-import { useEffect, useState, type ReactNode } from 'react'
-import { readTelemetry, resolveOrderExecution, type Debate, type Items, type Section } from './telemetry'
+import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import {
+  postKillSwitchAction,
+  readTelemetry,
+  resolveOrderExecution,
+  resolvePaperSwitchArmed,
+  resolveTradingState,
+  type Debate,
+  type Items,
+  type Order,
+  type Section,
+} from './telemetry'
 
 type Telemetry = Awaited<ReturnType<typeof readTelemetry>>
 
 const number = new Intl.NumberFormat('en-US', { maximumFractionDigits: 4 })
+const price = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 })
 const date = new Intl.DateTimeFormat('en-GB', {
   day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', timeZone: 'UTC',
 })
 
 function readableStatus(value: string) {
   return value.replaceAll('_', ' ').toLowerCase().replace(/^./, ch => ch.toUpperCase())
+}
+
+function formatTradingStateLabel(state: string | null) {
+  switch (state) {
+    case 'ACTIVE': return 'Active'
+    case 'HALTED_MANUAL': return 'Halted Manual'
+    case 'HALTED_DAILY_LOSS': return 'Halted Daily Loss'
+    case 'HALTED_SYSTEM_ERROR': return 'Halted System Error'
+    default: return 'Unavailable'
+  }
+}
+
+function orderStatusClass(status: string) {
+  const normalized = status.toUpperCase()
+  if (normalized === 'REJECTED_PREFLIGHT' || normalized === 'FAILED_BROKER' || normalized === 'CANCELED' || normalized === 'REJECTED') {
+    return 'tag danger'
+  }
+  if (normalized === 'DUPLICATE') return 'tag warning'
+  return 'tag ready'
 }
 
 function UtcTime({ value }: { value: string }) {
@@ -71,10 +101,10 @@ function DebateCard({ debate }: { debate: Debate }) {
         </div>
         <Stage name="JudgeAgent" data={debate.judge} />
         <div className="stage">
-          <h3>HardRiskManager · Shadow verdict</h3>
+          <h3>HardRiskManager · Verdict</h3>
           {risk ? (
             <>
-              <p>{risk.approved ? 'Shadow approved' : 'Shadow rejected'}{risk.tradingState ? ' · ' + readableStatus(risk.tradingState) : ''}</p>
+              <p>{risk.approved ? 'Risk approved' : 'Risk rejected'}{risk.tradingState ? ' · ' + readableStatus(risk.tradingState) : ''}</p>
               {risk.rejectionReason && <p>{risk.rejectionReason}</p>}
               {risk.calculatedQty != null && <p>Calculated quantity {number.format(risk.calculatedQty)}</p>}
               {Array.isArray(risk.violations) && risk.violations.length > 0 ? (
@@ -83,10 +113,41 @@ function DebateCard({ debate }: { debate: Debate }) {
                 ))}</ul>
               ) : <p className="muted">No violations reported.</p>}
             </>
-          ) : <p className="muted">No shadow verdict recorded.</p>}
+          ) : <p className="muted">No verdict recorded.</p>}
         </div>
       </div>
     </details>
+  )
+}
+
+function OrdersTable({ items }: { items: Order[] }) {
+  return (
+    <div className="table-scroll" tabIndex={0}>
+      <table>
+        <thead>
+          <tr>
+            {['Symbol', 'Side', 'Qty', 'Limit', 'Stop Loss', 'Take Profit', 'Status', 'Client Order ID', 'Updated'].map(label => (
+              <th key={label} scope="col">{label}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {items.map(order => (
+            <tr key={order.clientOrderId}>
+              <th scope="row">{order.symbol}</th>
+              <td>{order.side}</td>
+              <td>{number.format(order.qty)}</td>
+              <td>{order.limitPrice == null ? '—' : price.format(order.limitPrice)}</td>
+              <td>{order.stopLossPrice == null ? '—' : price.format(order.stopLossPrice)}</td>
+              <td>{order.takeProfitPrice == null ? '—' : price.format(order.takeProfitPrice)}</td>
+              <td><span className={orderStatusClass(order.status)}>{readableStatus(order.status)}</span></td>
+              <td><code className="order-id">{order.clientOrderId}</code></td>
+              <td><UtcTime value={order.updatedAtUtc} /></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   )
 }
 
@@ -94,26 +155,37 @@ export default function App() {
   const [telemetry, setTelemetry] = useState<Telemetry>()
   const [lastChecked, setLastChecked] = useState<Date>()
   const [autoRefresh, setAutoRefresh] = useState(true)
+  const [confirmingResume, setConfirmingResume] = useState(false)
+  const [actionPending, setActionPending] = useState<'halt' | 'resume' | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+
+  const refreshNow = useCallback(async (parentSignal?: AbortSignal) => {
+    const signal = parentSignal
+      ? AbortSignal.any([parentSignal, AbortSignal.timeout(5000)])
+      : AbortSignal.timeout(5000)
+    const data = await readTelemetry(signal)
+    if (parentSignal?.aborted) return
+    setTelemetry(data)
+    setLastChecked(new Date())
+  }, [])
 
   useEffect(() => {
     const controller = new AbortController()
     let timer: number | undefined
 
-    async function refresh() {
-      const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(5000)])
-      const data = await readTelemetry(signal)
-      if (controller.signal.aborted) return
-      setTelemetry(data)
-      setLastChecked(new Date())
-      if (autoRefresh) timer = window.setTimeout(refresh, 15000)
+    async function poll() {
+      await refreshNow(controller.signal)
+      if (!controller.signal.aborted && autoRefresh) {
+        timer = window.setTimeout(poll, 15000)
+      }
     }
 
-    if (autoRefresh) void refresh()
+    if (autoRefresh) void poll()
     return () => {
       controller.abort()
       window.clearTimeout(timer)
     }
-  }, [autoRefresh])
+  }, [autoRefresh, refreshNow])
 
   const health = telemetry?.health.state === 'ready' ? telemetry.health.value : null
   const overview = telemetry?.overview.state === 'ready' ? telemetry.overview.value : null
@@ -121,14 +193,63 @@ export default function App() {
   const systemStatus = !telemetry ? 'Checking host' : health ? 'Host online' : 'Host unreachable'
   const counts = overview?.counts
   const orderExecution = resolveOrderExecution(health, overview)
+  const tradingState = resolveTradingState(health, overview)
+  const paperSwitchArmed = resolvePaperSwitchArmed(health, overview)
+  const isHalted = Boolean(tradingState?.startsWith('HALTED'))
+  const controlsAvailable = Boolean(health) && overview?.databaseConfigured !== false
+
+  useEffect(() => {
+    if (tradingState !== 'HALTED_MANUAL') {
+      setConfirmingResume(false)
+    }
+  }, [tradingState])
+
+  async function handleKillSwitch(action: 'halt' | 'resume') {
+    setActionPending(action)
+    setActionError(null)
+    const result = await postKillSwitchAction(action, AbortSignal.timeout(5000))
+    setActionPending(null)
+    setConfirmingResume(false)
+    if (!result.ok) {
+      const message = result.error === 'cannot_resume_state'
+        ? `Manual resume blocked while trading state is ${readableStatus(result.tradingState ?? 'halted')}.`
+        : result.error === 'database_not_configured'
+          ? 'PostgreSQL is not configured on the host.'
+          : `Kill-switch ${action} failed (${readableStatus(result.error)}).`
+      setActionError(message)
+    }
+    await refreshNow()
+  }
+
+  let executionBadgeClass = 'tag'
+  let executionBadgeText = 'Disabled (Shadow Only)'
+  if (paperSwitchArmed === true && tradingState === 'ACTIVE') {
+    executionBadgeClass = 'tag warning'
+    executionBadgeText = 'Paper Armed (paper-api.alpaca.markets)'
+  } else if (paperSwitchArmed === true) {
+    executionBadgeClass = 'tag danger'
+    executionBadgeText = 'Paper Switch Armed · Halted'
+  } else if (paperSwitchArmed === null && orderExecution === true) {
+    executionBadgeClass = 'tag warning'
+    executionBadgeText = 'Paper Armed (paper-api.alpaca.markets)'
+  } else if (paperSwitchArmed === null && orderExecution === null) {
+    executionBadgeClass = 'tag danger'
+    executionBadgeText = 'Unverified'
+  }
+
+  const tradingStateClass = tradingState === 'ACTIVE'
+    ? 'tag ready'
+    : isHalted
+      ? 'tag danger'
+      : 'tag'
 
   return (
     <main>
       <header className="header">
         <div>
           <p className="product">SentiX</p>
-          <h1>Shadow cockpit</h1>
-          <p className="muted">Phase {overview?.phase ?? health?.phase ?? '3'} · Read-only market telemetry</p>
+          <h1>Paper &amp; shadow cockpit</h1>
+          <p className="muted">Phase {overview?.phase ?? health?.phase ?? '4'} · Paper-only execution &amp; read-only telemetry</p>
         </div>
         <div className="toolbar">
           <span className={health ? 'tag ready' : 'tag'}>{systemStatus}</span>
@@ -139,33 +260,140 @@ export default function App() {
         </div>
       </header>
 
-      <section aria-labelledby="overview">
+      <section aria-labelledby="kill-switch">
         <div className="section-heading">
-          <h2 id="overview">System &amp; pipeline overview</h2>
+          <h2 id="kill-switch">Kill-switch &amp; execution mode</h2>
           {lastChecked && <p className="muted">Last checked <UtcTime value={lastChecked.toISOString()} /></p>}
         </div>
-        <dl className="system-grid">
-          <div><dt>Native Scorer</dt><dd>{nativeState ? readableStatus(nativeState) : 'Unknown'}</dd></div>
-          <div><dt>Decision Swarm</dt><dd>{overview?.decisionSwarmConfigured === false ? 'Not configured' : counts?.debates != null ? number.format(counts.debates) + ' debates' : 'No telemetry'}</dd></div>
-          <div><dt>Hard Risk Shadow</dt><dd>{counts?.riskEvaluated != null ? number.format(counts.riskEvaluated) + ' evaluated' : 'No telemetry'}</dd></div>
-          <div>
-            <dt>Order Execution</dt>
-            <dd><span className={orderExecution === false ? 'tag' : 'tag danger'}>
-              {orderExecution === false ? 'Disabled (Shadow Only)' : orderExecution === true ? 'Unexpectedly enabled' : 'Unverified'}
-            </span></dd>
+
+        <div className="kill-switch-panel">
+          <dl className="system-grid">
+            <div>
+              <dt>Trading State</dt>
+              <dd><span className={tradingStateClass}>{formatTradingStateLabel(tradingState)}</span></dd>
+            </div>
+            <div>
+              <dt>Execution Mode</dt>
+              <dd><span className={executionBadgeClass}>{executionBadgeText}</span></dd>
+            </div>
+            <div>
+              <dt>Native Scorer</dt>
+              <dd>{nativeState ? readableStatus(nativeState) : 'Unknown'}</dd>
+            </div>
+            <div>
+              <dt>Decision Swarm</dt>
+              <dd>{overview?.decisionSwarmConfigured === false ? 'Not configured' : counts?.debates != null ? number.format(counts.debates) + ' debates' : 'No telemetry'}</dd>
+            </div>
+          </dl>
+
+          {isHalted && tradingState && (
+            <div className="safety-alert" role="alert">
+              <strong>Kill-Switch Engaged · {readableStatus(tradingState)}</strong>
+              <span>All paper order submissions are blocked fail-closed until trading state returns to Active.</span>
+            </div>
+          )}
+
+          {paperSwitchArmed === true && tradingState === 'ACTIVE' && (
+            <p className="paper-armed-notice" role="status">
+              Paper Armed (paper-api.alpaca.markets) — HardRiskManager-approved proposals dispatch Long-Only whole-share bracket orders to Alpaca Paper API.
+            </p>
+          )}
+
+          {paperSwitchArmed === null && orderExecution === null && (
+            <p className="safety-alert" role="alert">
+              The host has not confirmed execution mode status.
+            </p>
+          )}
+
+          <div className="operator-controls">
+            {tradingState === 'ACTIVE' && (
+              <button
+                type="button"
+                className="btn danger"
+                disabled={!controlsAvailable || actionPending !== null}
+                onClick={() => void handleKillSwitch('halt')}
+              >
+                {actionPending === 'halt' ? 'Engaging kill-switch…' : 'Engage Kill-Switch (HALT)'}
+              </button>
+            )}
+
+            {tradingState === 'HALTED_MANUAL' && !confirmingResume && (
+              <button
+                type="button"
+                className="btn"
+                disabled={!controlsAvailable || actionPending !== null}
+                onClick={() => {
+                  setActionError(null)
+                  setConfirmingResume(true)
+                }}
+              >
+                Resume to Active
+              </button>
+            )}
+
+            {tradingState === 'HALTED_MANUAL' && confirmingResume && (
+              <div className="confirm-bar" role="group" aria-label="Confirm manual resume">
+                <span className="muted">Re-arm trading state to Active?</span>
+                <button
+                  type="button"
+                  className="btn warning"
+                  disabled={!controlsAvailable || actionPending !== null}
+                  onClick={() => void handleKillSwitch('resume')}
+                >
+                  {actionPending === 'resume' ? 'Resuming…' : 'Confirm Resume'}
+                </button>
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={actionPending !== null}
+                  onClick={() => setConfirmingResume(false)}
+                >
+                  Cancel
+                </button>
+              </div>
+            )}
+
+            {(tradingState === 'HALTED_DAILY_LOSS' || tradingState === 'HALTED_SYSTEM_ERROR') && (
+              <p className="circuit-lock-note">
+                Manual UI resume is locked by the hard-risk circuit breaker (database recovery required).
+              </p>
+            )}
+
+            {!controlsAvailable && (
+              <p className="muted">
+                {overview?.databaseConfigured === false
+                  ? 'Operator kill-switch controls require PostgreSQL to be configured.'
+                  : 'Connect to a live host with PostgreSQL to operate the persisted kill-switch.'}
+              </p>
+            )}
           </div>
-        </dl>
-        {orderExecution !== false && (
-          <p className="safety-alert" role="alert">
-            {orderExecution === true ? 'Host reports that order execution is enabled.' : 'The host has not confirmed that order execution is disabled.'}
-          </p>
-        )}
+
+          {actionError && (
+            <p className="safety-alert" role="alert">{actionError}</p>
+          )}
+        </div>
+
         <dl className="metrics">
           <div><dt>Events</dt><dd>{counts?.events != null ? number.format(counts.events) : '—'}</dd></div>
           <div><dt>Fast-path passes</dt><dd>{counts?.fastPathPassed != null ? number.format(counts.fastPathPassed) : '—'}</dd></div>
-          <div><dt>Shadow approvals</dt><dd>{counts?.riskApproved != null ? number.format(counts.riskApproved) : '—'}</dd></div>
+          <div><dt>Risk approvals</dt><dd>{counts?.riskApproved != null ? number.format(counts.riskApproved) : '—'}</dd></div>
+          <div>
+            <dt>Paper orders</dt>
+            <dd>
+              {counts?.ordersSubmitted != null && counts?.ordersTotal != null
+                ? `${number.format(counts.ordersSubmitted)} / ${number.format(counts.ordersTotal)}`
+                : '—'}
+            </dd>
+          </div>
           <div><dt>Cached quotes</dt><dd>{counts?.cachedQuotes != null ? number.format(counts.cachedQuotes) : '—'}</dd></div>
         </dl>
+      </section>
+
+      <section aria-labelledby="orders">
+        <div className="section-heading"><h2 id="orders">Paper orders audit</h2></div>
+        <DataList section={telemetry?.orders} empty="No paper orders have been recorded.">
+          {items => <OrdersTable items={items} />}
+        </DataList>
       </section>
 
       <section aria-labelledby="debates">

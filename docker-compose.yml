@@ -45,6 +45,8 @@ services:
       ConnectionStrings__Default: Host=sentix-db;Database=sentix;Username=sentix;Password=${POSTGRES_PASSWORD}
       Sentix__NativeSocketPath: /run/sentix/native.sock
       Sentix__ConfigPath: /config/universe.json
+      ALPACA_TRADING_ENABLED: ${ALPACA_TRADING_ENABLED:-false}
+      Alpaca__TradingEnabled: ${ALPACA_TRADING_ENABLED:-false}
       Alpaca__PaperMode: "true"
       Alpaca__AllowShorting: ${ALPACA_ALLOW_SHORTING:-false}
       Alpaca__ApiKey: ${ALPACA_API_KEY}

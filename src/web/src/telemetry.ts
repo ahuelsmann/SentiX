@@ -3,12 +3,18 @@ export type Health = {
   native: string
   phase: number
   tradingEnabled: boolean | null
+  tradingState: string | null
+  paperSwitchArmed: boolean | null
+  paperExecutionConfigured: boolean | null
 }
 
 export type Overview = {
   phase: number
   nativeStatus: string
   orderExecutionEnabled: boolean | null
+  tradingState: string | null
+  paperSwitchArmed: boolean | null
+  paperExecutionConfigured: boolean | null
   databaseConfigured: boolean
   decisionSwarmConfigured?: boolean
   counts: {
@@ -17,9 +23,29 @@ export type Overview = {
     debates: number | null
     riskEvaluated: number | null
     riskApproved: number | null
+    ordersTotal: number | null
+    ordersSubmitted: number | null
+    ordersRejected: number | null
     cachedQuotes: number | null
     upcomingCalendar: number | null
   }
+}
+
+export type Order = {
+  clientOrderId: string
+  alpacaOrderId: string | null
+  proposalId: string | null
+  symbol: string
+  side: string
+  orderType: string
+  qty: number
+  limitPrice: number | null
+  stopLossPrice: number | null
+  takeProfitPrice: number | null
+  status: string
+  filledAvgPrice: number | null
+  submittedAtUtc: string | null
+  updatedAtUtc: string
 }
 
 export type Debate = {
@@ -72,6 +98,10 @@ export type Section<T> =
 
 export type Items<T> = { items: T[]; databaseConfigured?: boolean; dropped: number }
 
+export type KillSwitchActionResult =
+  | { ok: true; tradingState: string; updatedAtUtc: string | null; updatedBy: string | null }
+  | { ok: false; status: number | null; error: string; tradingState: string | null }
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
@@ -102,13 +132,30 @@ export function resolveOrderExecution(health?: Health | null, overview?: Overvie
   return health?.tradingEnabled ?? overview?.orderExecutionEnabled ?? null
 }
 
+export function resolveTradingState(health?: Health | null, overview?: Overview | null): string | null {
+  return overview?.tradingState ?? health?.tradingState ?? null
+}
+
+export function resolvePaperSwitchArmed(health?: Health | null, overview?: Overview | null): boolean | null {
+  if (health?.paperSwitchArmed === true || overview?.paperSwitchArmed === true) return true
+  return overview?.paperSwitchArmed ?? health?.paperSwitchArmed ?? null
+}
+
 function decodeHealth(value: unknown): Health | null {
   if (!isRecord(value)) return null
   const status = text(value.status)
   const native = nativeStatus(value)
   const phase = finite(value.phase)
   if (status === null || native === null || phase === null) return null
-  return { status, native, phase, tradingEnabled: readBoolean(value.orderExecutionEnabled ?? value.tradingEnabled) }
+  return {
+    status,
+    native,
+    phase,
+    tradingEnabled: readBoolean(value.orderExecutionEnabled ?? value.tradingEnabled),
+    tradingState: text(value.tradingState),
+    paperSwitchArmed: readBoolean(value.paperSwitchArmed),
+    paperExecutionConfigured: readBoolean(value.paperExecutionConfigured),
+  }
 }
 
 function decodeOverview(value: unknown): Overview | null {
@@ -121,6 +168,9 @@ function decodeOverview(value: unknown): Overview | null {
     phase,
     nativeStatus: native,
     orderExecutionEnabled: readBoolean(value.orderExecutionEnabled ?? value.tradingEnabled),
+    tradingState: text(value.tradingState),
+    paperSwitchArmed: readBoolean(value.paperSwitchArmed),
+    paperExecutionConfigured: readBoolean(value.paperExecutionConfigured),
     databaseConfigured: value.databaseConfigured !== false,
     decisionSwarmConfigured: typeof value.decisionSwarmConfigured === 'boolean' ? value.decisionSwarmConfigured : undefined,
     counts: {
@@ -131,9 +181,41 @@ function decodeOverview(value: unknown): Overview | null {
         (typeof counts.shadowApproved === 'number' && typeof counts.shadowBlocked === 'number'
           ? counts.shadowApproved + counts.shadowBlocked : null),
       riskApproved: finite(counts.riskApproved ?? counts.shadowApproved),
+      ordersTotal: finite(counts.ordersTotal),
+      ordersSubmitted: finite(counts.ordersSubmitted),
+      ordersRejected: finite(counts.ordersRejected),
       cachedQuotes: finite(counts.cachedQuotes ?? counts.quotes),
       upcomingCalendar: finite(counts.upcomingCalendar ?? counts.scheduledEvents),
     },
+  }
+}
+
+export function decodeOrder(value: unknown): Order | null {
+  if (!isRecord(value)) return null
+  const clientOrderId = identifier(value.clientOrderId ?? value.id)
+  const symbol = text(value.symbol ?? value.ticker)
+  const side = text(value.side)
+  const orderType = text(value.orderType ?? value.type) ?? 'LIMIT'
+  const qty = finite(value.qty ?? value.quantity)
+  const status = text(value.status)
+  const updatedAtUtc = text(value.updatedAtUtc ?? value.submittedAtUtc ?? value.createdAtUtc)
+  if (!clientOrderId || !symbol || !side || qty === null || qty < 1 || !status || !updatedAtUtc) return null
+
+  return {
+    clientOrderId,
+    alpacaOrderId: text(value.alpacaOrderId),
+    proposalId: identifier(value.proposalId),
+    symbol,
+    side,
+    orderType,
+    qty,
+    limitPrice: finite(value.limitPrice),
+    stopLossPrice: finite(value.stopLossPrice),
+    takeProfitPrice: finite(value.takeProfitPrice),
+    status,
+    filledAvgPrice: finite(value.filledAvgPrice),
+    submittedAtUtc: text(value.submittedAtUtc),
+    updatedAtUtc,
   }
 }
 
@@ -231,13 +313,59 @@ function itemDecoder<T>(decode: (value: unknown) => T | null) {
   }
 }
 
+export async function postKillSwitchAction(
+  action: 'halt' | 'resume',
+  signal?: AbortSignal,
+): Promise<KillSwitchActionResult> {
+  const confirmValue = action === 'halt' ? 'HALT' : 'RESUME'
+  try {
+    const response = await fetch(`/api/system-state/${action}`, {
+      method: 'POST',
+      cache: 'no-store',
+      signal,
+      headers: {
+        'X-SentiX-Confirm': confirmValue,
+      },
+    })
+    let payload: unknown = null
+    try {
+      payload = await response.json()
+    } catch {
+      payload = null
+    }
+    const record = isRecord(payload) ? payload : null
+    if (response.ok) {
+      return {
+        ok: true,
+        tradingState: text(record?.tradingState) ?? (action === 'halt' ? 'HALTED_MANUAL' : 'ACTIVE'),
+        updatedAtUtc: text(record?.updatedAtUtc),
+        updatedBy: text(record?.updatedBy),
+      }
+    }
+    return {
+      ok: false,
+      status: response.status,
+      error: text(record?.error) ?? `http_${response.status}`,
+      tradingState: text(record?.tradingState),
+    }
+  } catch {
+    return {
+      ok: false,
+      status: null,
+      error: 'network_error',
+      tradingState: null,
+    }
+  }
+}
+
 export async function readTelemetry(signal: AbortSignal) {
-  const [health, overview, debates, quotes, calendar] = await Promise.all([
+  const [health, overview, orders, debates, quotes, calendar] = await Promise.all([
     read('/health', signal, decodeHealth),
     read('/api/overview', signal, decodeOverview),
+    read('/api/orders?limit=25', signal, itemDecoder(decodeOrder)),
     read('/api/debates?limit=25', signal, itemDecoder(decodeDebate)),
     read('/api/quotes', signal, itemDecoder(decodeQuote)),
     read('/api/calendar', signal, itemDecoder(decodeCalendarEvent)),
   ])
-  return { health, overview, debates, quotes, calendar }
+  return { health, overview, orders, debates, quotes, calendar }
 }

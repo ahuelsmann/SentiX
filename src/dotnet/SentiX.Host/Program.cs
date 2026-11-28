@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using SentiX.DecisionSwarm;
 using SentiX.Domain;
+using SentiX.Execution;
 using SentiX.Host;
 using SentiX.Infrastructure;
 using SentiX.Ingestion;
@@ -59,6 +60,23 @@ builder.Services.AddDbContextFactory<SentiXDbContext>((services, options) =>
 builder.Services.AddSingleton<IMarketQuoteCache, InMemoryMarketQuoteCache>();
 builder.Services.AddSentiXDecisionSwarm(builder.Configuration);
 
+builder.Services.AddSingleton(services =>
+    AlpacaPaperOptions.FromConfiguration(services.GetRequiredService<IConfiguration>()));
+
+builder.Services.AddSingleton<ITradingStateStore>(services =>
+{
+    var config = services.GetRequiredService<IConfiguration>();
+    var hasDb = !string.IsNullOrWhiteSpace(config.GetConnectionString("Default"));
+    return hasDb
+        ? new EfCoreTradingStateStore(
+            services.GetRequiredService<IDbContextFactory<SentiXDbContext>>(),
+            services.GetRequiredService<TimeProvider>(),
+            services.GetRequiredService<ILogger<EfCoreTradingStateStore>>())
+        : new UnconfiguredTradingStateStore(services.GetRequiredService<TimeProvider>());
+});
+builder.Services.AddSingleton<ITradingStateProvider>(services => services.GetRequiredService<ITradingStateStore>());
+builder.Services.AddSentiXPaperExecution(builder.Configuration);
+
 builder.Services.AddSingleton<IMarketEventPipeline>(services => new MarketEventPipeline(
     services.GetRequiredService<IDbContextFactory<SentiXDbContext>>(),
     services.GetRequiredService<NativeBridgeClient>(),
@@ -67,7 +85,9 @@ builder.Services.AddSingleton<IMarketEventPipeline>(services => new MarketEventP
     services.GetRequiredService<IDecisionSwarmOrchestrator>(),
     services.GetRequiredService<IMarketQuoteCache>(),
     services.GetRequiredService<UniverseConfig>(),
-    services.GetRequiredService<TimeProvider>()));
+    services.GetRequiredService<TimeProvider>(),
+    services.GetRequiredService<IPaperExecutionEngine>(),
+    services.GetRequiredService<AlpacaPaperOptions>()));
 
 builder.Services.AddSingleton(services =>
 {
@@ -87,6 +107,7 @@ builder.Services.AddHttpClient<ScheduledEventsSyncWorker>().ConfigurePrimaryHttp
 {
     AllowAutoRedirect = false
 });
+builder.Services.AddHostedService<DatabaseStartupInitializer>();
 builder.Services.AddHostedService(services => services.GetRequiredService<SecEdgarCollector>());
 builder.Services.AddHostedService(services => services.GetRequiredService<ScheduledEventsSyncWorker>());
 builder.Services.AddHostedService<AlpacaQuotesCollector>();

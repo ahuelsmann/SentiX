@@ -4,6 +4,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using SentiX.DecisionSwarm;
 using SentiX.Domain;
+using SentiX.Execution;
 using SentiX.Infrastructure;
 using SentiX.NativeBridge;
 using SentiX.Risk;
@@ -31,7 +32,9 @@ public sealed class MarketEventPipeline(
     IDecisionSwarmOrchestrator? decisionSwarm = null,
     IMarketQuoteCache? quoteCache = null,
     UniverseConfig? universe = null,
-    TimeProvider? timeProvider = null) : IMarketEventPipeline, IDisposable
+    TimeProvider? timeProvider = null,
+    IPaperExecutionEngine? paperExecution = null,
+    AlpacaPaperOptions? paperOptions = null) : IMarketEventPipeline, IDisposable
 {
     private readonly SemaphoreSlim migration = new(1, 1);
     private readonly TimeProvider clock = timeProvider ?? TimeProvider.System;
@@ -157,6 +160,7 @@ public sealed class MarketEventPipeline(
             return;
         }
 
+        var evaluatedAtUtc = clock.GetUtcNow();
         var persistedAction = proposal.Action.ToString().ToUpperInvariant();
         var ticker = string.IsNullOrWhiteSpace(proposal.Ticker) ? null : proposal.Ticker.Trim().ToUpperInvariant();
         var debateRow = new DecisionDebateRow(
@@ -173,7 +177,7 @@ public sealed class MarketEventPipeline(
             proposal.Confidence,
             outcome.TotalTokens,
             (int)Math.Clamp(outcome.TotalLatencyMs, 0, int.MaxValue),
-            now);
+            evaluatedAtUtc);
 
         var persistedTradingState = await db.SystemState.AsNoTracking()
             .Where(row => row.Id == 1)
@@ -181,8 +185,8 @@ public sealed class MarketEventPipeline(
             .SingleOrDefaultAsync(token);
         var tradingState = ParsePersistedTradingState(persistedTradingState);
 
-        // Phase 3 runs HardRiskManager strictly in shadow mode (virtual paper portfolio, zero broker orders).
-        var riskDecision = EvaluateShadowHardRisk(proposal, ticker, quoteCache, universe, tradingState, now);
+        var (riskProposal, entryPrice, riskDecision) = EvaluateHardRiskWithInputs(
+            proposal, ticker, quoteCache, universe, tradingState, evaluatedAtUtc);
         var violationsJson = JsonSerializer.Serialize(
             riskDecision.Violations.Select(static v => new { code = v.Code.ToString(), message = v.Message }),
             SentiXJson.Options);
@@ -197,31 +201,179 @@ public sealed class MarketEventPipeline(
             riskDecision.ClampedStopLossPct is { } sl ? (double)sl : null,
             riskDecision.ClampedTakeProfitPct is { } tp ? (double)tp : null,
             riskDecision.ClientOrderId,
-            now);
+            evaluatedAtUtc);
 
         db.DecisionDebates.Add(debateRow);
         db.RiskEvaluations.Add(riskRow);
         await db.SaveChangesAsync(token);
+
+        if (paperExecution is not null &&
+            paperOptions is { TradingEnabled: true } &&
+            riskDecision.Approved &&
+            proposal.Action != DomainTradeAction.Hold &&
+            !string.IsNullOrWhiteSpace(riskDecision.ClientOrderId) &&
+            !string.IsNullOrWhiteSpace(ticker))
+        {
+            await ExecuteAndPersistPaperOrderAsync(
+                proposal.ProposalId,
+                ticker,
+                proposal.Action,
+                riskProposal,
+                riskDecision,
+                entryPrice,
+                token);
+        }
+    }
+
+    private async Task ExecuteAndPersistPaperOrderAsync(
+        string proposalId,
+        string normalizedTicker,
+        DomainTradeAction action,
+        RiskProposal riskProposal,
+        RiskDecision riskDecision,
+        decimal entryPrice,
+        CancellationToken token)
+    {
+        var expectedClientOrderId = riskDecision.ClientOrderId!;
+        try
+        {
+            await using var preCheckDb = await dbFactory.CreateDbContextAsync(token);
+            if (await preCheckDb.Orders.AsNoTracking().AnyAsync(o => o.ClientOrderId == expectedClientOrderId, token))
+            {
+                return;
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(
+                "Skipping paper execution because pre-execution orders idempotency check failed for {ClientOrderId} ({ErrorType}).",
+                expectedClientOrderId,
+                ex.GetType().Name);
+            return;
+        }
+
+        PaperOrderExecutionRequest execRequest;
+        PaperExecutionResult execResult;
+        try
+        {
+            execRequest = PaperOrderExecutionRequest.FromRiskDecision(riskProposal, riskDecision, entryPrice);
+            execResult = await paperExecution!.ExecuteAsync(execRequest, token);
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(
+                "Paper order execution failed unexpectedly for ProposalId={ProposalId}, ClientOrderId={ClientOrderId} ({ErrorType}).",
+                proposalId,
+                expectedClientOrderId,
+                ex.GetType().Name);
+            return;
+        }
+
+        var orderRow = MapOrderRow(
+            proposalId,
+            normalizedTicker,
+            action,
+            execRequest,
+            execResult,
+            clock.GetUtcNow());
+
+        try
+        {
+            await using var orderDb = await dbFactory.CreateDbContextAsync(token);
+            var exists = await orderDb.Orders.AsNoTracking()
+                .AnyAsync(o => o.ClientOrderId == orderRow.ClientOrderId, token);
+            if (!exists)
+            {
+                orderDb.Orders.Add(orderRow);
+                await orderDb.SaveChangesAsync(token);
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(
+                "Failed to persist paper order audit row for ProposalId={ProposalId}, ClientOrderId={ClientOrderId}, Status={Status} ({ErrorType}).",
+                proposalId,
+                orderRow.ClientOrderId,
+                orderRow.Status,
+                ex.GetType().Name);
+        }
+    }
+
+    internal static OrderRow MapOrderRow(
+        string proposalId,
+        string normalizedTicker,
+        DomainTradeAction action,
+        PaperOrderExecutionRequest request,
+        PaperExecutionResult result,
+        DateTimeOffset nowUtc)
+    {
+        var clientOrderId = !string.IsNullOrWhiteSpace(result.ClientOrderId)
+            ? result.ClientOrderId
+            : request.RiskDecision.ClientOrderId!;
+        var alpacaOrderId = string.IsNullOrWhiteSpace(result.Receipt?.OrderId)
+            ? null
+            : result.Receipt.OrderId.Trim();
+        var side = action == DomainTradeAction.Buy ? "BUY" : "SELL";
+        var orderType = request.OrderType == ExecutionOrderType.Market ? "MARKET" : "LIMIT";
+        var status = result.Status switch
+        {
+            ExecutionOutcomeStatus.Submitted => !string.IsNullOrWhiteSpace(result.Receipt?.Status)
+                ? result.Receipt.Status.Trim().ToUpperInvariant()
+                : "SUBMITTED",
+            ExecutionOutcomeStatus.DuplicateOrder => "DUPLICATE",
+            ExecutionOutcomeStatus.RejectedPreFlight => "REJECTED_PREFLIGHT",
+            ExecutionOutcomeStatus.FailedBroker => "FAILED_BROKER",
+            _ => "FAILED_BROKER"
+        };
+        var submittedAtUtc = result.Status == ExecutionOutcomeStatus.Submitted
+            ? (result.Receipt?.SubmittedAtUtc ?? nowUtc)
+            : nowUtc;
+
+        return new OrderRow(
+            clientOrderId,
+            alpacaOrderId,
+            proposalId,
+            normalizedTicker,
+            side,
+            orderType,
+            request.RiskDecision.CalculatedQuantity,
+            request.LimitPrice,
+            request.StopLossPrice,
+            request.TakeProfitPrice,
+            status,
+            result.Receipt?.FilledAvgPrice,
+            submittedAtUtc,
+            nowUtc);
     }
 
     internal static SentiX.Risk.TradingState ParsePersistedTradingState(string? raw)
     {
-        if (string.IsNullOrWhiteSpace(raw))
-        {
-            return SentiX.Risk.TradingState.HaltedSystemError;
-        }
-
-        return raw.Trim().ToUpperInvariant() switch
-        {
-            "ACTIVE" => SentiX.Risk.TradingState.Active,
-            "HALTED_DAILY_LOSS" => SentiX.Risk.TradingState.HaltedDailyLoss,
-            "HALTED_MANUAL" => SentiX.Risk.TradingState.HaltedManual,
-            "HALTED_SYSTEM_ERROR" => SentiX.Risk.TradingState.HaltedSystemError,
-            _ => SentiX.Risk.TradingState.HaltedSystemError,
-        };
+        var parsed = SystemStateParser.Parse(raw);
+        return parsed.Success ? parsed.State : SentiX.Risk.TradingState.HaltedSystemError;
     }
 
     internal static RiskDecision EvaluateShadowHardRisk(
+        SentiX.Domain.TradeProposal proposal,
+        string? normalizedTicker,
+        IMarketQuoteCache? quoteCache,
+        UniverseConfig? universe,
+        SentiX.Risk.TradingState tradingState,
+        DateTimeOffset nowUtc) =>
+        EvaluateHardRiskWithInputs(proposal, normalizedTicker, quoteCache, universe, tradingState, nowUtc).Decision;
+
+    internal static (RiskProposal Proposal, decimal EntryPrice, RiskDecision Decision) EvaluateHardRiskWithInputs(
         SentiX.Domain.TradeProposal proposal,
         string? normalizedTicker,
         IMarketQuoteCache? quoteCache,
@@ -280,7 +432,8 @@ public sealed class MarketEventPipeline(
             LastTradeTimesUtc: new Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase));
 
         var policy = new RiskPolicy { AllowedTickers = allowedTickers };
-        return HardRiskManager.Evaluate(riskProposal, shadowPortfolio, new MarketClock(nowUtc), policy);
+        var decision = HardRiskManager.Evaluate(riskProposal, shadowPortfolio, new MarketClock(nowUtc), policy);
+        return (riskProposal, askPrice, decision);
     }
 
     public void Dispose() => migration.Dispose();

@@ -46,6 +46,9 @@ public sealed class AlpacaPaperOptions
     /// <summary>True when both <see cref="ApiKey"/> and <see cref="SecretKey"/> are present and non-placeholder.</summary>
     public bool HasUsableCredentials => IsUsableSecret(ApiKey) && IsUsableSecret(SecretKey);
 
+    /// <summary>True when credentials and strict paper-only endpoint invariants are valid (independent of <see cref="TradingEnabled"/>).</summary>
+    public bool IsConfigured => TryValidateExecutionSafety(out _, out _);
+
     /// <summary>
     /// Validates whether the options permit paper order dispatch (ignoring <see cref="TradingEnabled"/>).
     /// </summary>
