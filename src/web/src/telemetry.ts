@@ -1,5 +1,13 @@
+declare const __APP_VERSION__: string | undefined
+
+export const BUILD_VERSION =
+  typeof __APP_VERSION__ === 'string' && __APP_VERSION__.trim().length > 0
+    ? __APP_VERSION__.trim()
+    : '0.4.0'
+
 export type Health = {
   status: string
+  version?: string | null
   native: string
   phase: number
   tradingEnabled: boolean | null
@@ -10,6 +18,7 @@ export type Health = {
 }
 
 export type Overview = {
+  version?: string | null
   phase: number
   nativeStatus: string
   orderExecutionEnabled: boolean | null
@@ -148,6 +157,25 @@ export function resolvePaperExecutionConfigured(health?: Health | null, overview
   return overview?.paperExecutionConfigured ?? health?.paperExecutionConfigured ?? null
 }
 
+function normalizeVersion(value: string | null | undefined): string | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim().replace(/^[vV](?=\d)/, '')
+  return trimmed.length > 0 ? trimmed : null
+}
+
+export function resolveVersion(
+  health?: Health | null,
+  overview?: Overview | null,
+  fallback = BUILD_VERSION,
+): string {
+  return (
+    normalizeVersion(overview?.version) ??
+    normalizeVersion(health?.version) ??
+    normalizeVersion(fallback) ??
+    BUILD_VERSION
+  )
+}
+
 function decodeHealth(value: unknown): Health | null {
   if (!isRecord(value)) return null
   const status = text(value.status)
@@ -156,6 +184,7 @@ function decodeHealth(value: unknown): Health | null {
   if (status === null || native === null || phase === null) return null
   return {
     status,
+    version: text(value.version),
     native,
     phase,
     tradingEnabled: readBoolean(value.orderExecutionEnabled ?? value.tradingEnabled),
@@ -173,6 +202,7 @@ function decodeOverview(value: unknown): Overview | null {
   if (native === null || phase === null) return null
   const counts = value.counts
   return {
+    version: text(value.version),
     phase,
     nativeStatus: native,
     orderExecutionEnabled: readBoolean(value.orderExecutionEnabled ?? value.tradingEnabled),

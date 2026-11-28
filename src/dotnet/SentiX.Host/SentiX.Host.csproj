@@ -3,8 +3,11 @@
         <TargetFramework>net10.0</TargetFramework>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
+        <Version>0.4.0</Version>
+        <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     </PropertyGroup>
     <ItemGroup>
+        <InternalsVisibleTo Include="SentiX.Integration.Tests" />
         <ProjectReference Include="../SentiX.Execution/SentiX.Execution.csproj" />
         <ProjectReference Include="../SentiX.Ingestion/SentiX.Ingestion.csproj" />
         <Content Include="../../../config/universe.json" Link="config/universe.json"

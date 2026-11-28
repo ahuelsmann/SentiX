@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import test from 'node:test'
+import { fileURLToPath } from 'node:url'
 import {
+  BUILD_VERSION,
   decodeOrder,
   postKillSwitchAction,
   readTelemetry,
@@ -8,6 +12,7 @@ import {
   resolvePaperExecutionConfigured,
   resolvePaperSwitchArmed,
   resolveTradingState,
+  resolveVersion,
 } from '../src/telemetry.ts'
 
 const timestamp = '2026-06-04T00:00:00Z'
@@ -185,4 +190,24 @@ test('postKillSwitchAction sends mandatory X-SentiX-Confirm header and maps conf
     { path: '/api/system-state/halt', method: 'POST', headers: { 'X-SentiX-Confirm': 'HALT' }, cache: 'no-store' },
     { path: '/api/system-state/resume', method: 'POST', headers: { 'X-SentiX-Confirm': 'RESUME' }, cache: 'no-store' },
   ])
+})
+
+test('decodes host version, normalizes v-prefixes, and renders Shadow Dashboard title with version badge', async t => {
+  const result = await load(t, {
+    '/health': { ...health, version: 'v0.4.0' },
+    '/api/overview': { ...overview, version: '0.4.1+abc1234' },
+  })
+  assert.equal(result.health.value.version, 'v0.4.0')
+  assert.equal(result.overview.value.version, '0.4.1+abc1234')
+  assert.equal(resolveVersion(result.health.value, result.overview.value), '0.4.1+abc1234')
+  assert.equal(resolveVersion(result.health.value, null), '0.4.0')
+  assert.equal(resolveVersion(null, null), BUILD_VERSION)
+
+  const webRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
+  const appSource = readFileSync(join(webRoot, 'src', 'App.tsx'), 'utf8')
+  const indexHtml = readFileSync(join(webRoot, 'index.html'), 'utf8')
+  assert.match(appSource, /<h1>Shadow Dashboard<\/h1>/)
+  assert.match(appSource, /className="version-badge"[^>]*>v\{appVersion\}<\/span>/)
+  assert.doesNotMatch(appSource, /Paper &amp; shadow cockpit/i)
+  assert.match(indexHtml, /<title>SentiX · Shadow Dashboard<\/title>/)
 })

@@ -6,6 +6,7 @@ import {
   resolvePaperExecutionConfigured,
   resolvePaperSwitchArmed,
   resolveTradingState,
+  resolveVersion,
   type Debate,
   type Items,
   type Order,
@@ -204,6 +205,7 @@ export default function App() {
 
   const health = telemetry?.health.state === 'ready' ? telemetry.health.value : null
   const overview = telemetry?.overview.state === 'ready' ? telemetry.overview.value : null
+  const appVersion = resolveVersion(health, overview)
   const nativeState = overview?.nativeStatus ?? health?.native
   const systemStatus = !telemetry ? 'Checking host' : health ? 'Host online' : 'Host unreachable'
   const counts = overview?.counts
@@ -218,6 +220,10 @@ export default function App() {
     overview?.databaseConfigured !== false &&
     tradingState !== 'UNAVAILABLE' &&
     health?.databaseReachable !== false
+
+  useEffect(() => {
+    document.title = `SentiX · Shadow Dashboard (v${appVersion})`
+  }, [appVersion])
 
   useEffect(() => {
     if (tradingState !== 'HALTED_MANUAL') {
@@ -274,8 +280,11 @@ export default function App() {
     <main>
       <header className="header">
         <div>
-          <p className="product">SentiX</p>
-          <h1>Paper &amp; shadow cockpit</h1>
+          <div className="product-row">
+            <p className="product">SentiX</p>
+            <span className="version-badge" aria-label="Application version">v{appVersion}</span>
+          </div>
+          <h1>Shadow Dashboard</h1>
           <p className="muted">Phase {overview?.phase ?? health?.phase ?? '4'} · Paper-only execution &amp; read-only telemetry</p>
         </div>
         <div className="toolbar">

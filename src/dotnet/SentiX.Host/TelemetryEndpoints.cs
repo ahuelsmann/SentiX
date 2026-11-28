@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using SentiX.DecisionSwarm;
@@ -11,6 +12,44 @@ namespace SentiX.Host;
 
 internal static class TelemetryEndpoints
 {
+    internal const string DefaultHostVersion = "0.4.0";
+    internal static readonly string HostVersion = ResolveHostVersion();
+
+    internal static string ResolveHostVersion(string? rawInformationalVersion = null)
+    {
+        var raw = rawInformationalVersion
+            ?? typeof(TelemetryEndpoints).Assembly
+                .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?
+                .InformationalVersion
+            ?? typeof(TelemetryEndpoints).Assembly.GetName().Version?.ToString(3);
+
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return DefaultHostVersion;
+        }
+
+        var trimmed = raw.Trim();
+        if (trimmed.StartsWith('v') || trimmed.StartsWith('V'))
+        {
+            trimmed = trimmed[1..].Trim();
+        }
+
+        var plusIndex = trimmed.IndexOf('+');
+        if (plusIndex > 0)
+        {
+            var baseVersion = trimmed[..plusIndex].Trim();
+            var metadata = trimmed[(plusIndex + 1)..].Trim();
+            if (!string.IsNullOrEmpty(baseVersion))
+            {
+                return metadata.Length >= 7
+                    ? $"{baseVersion}+{metadata[..7]}"
+                    : baseVersion;
+            }
+        }
+
+        return string.IsNullOrEmpty(trimmed) ? DefaultHostVersion : trimmed;
+    }
+
     internal static IEndpointRouteBuilder MapTelemetryEndpoints(this IEndpointRouteBuilder endpoints)
     {
         endpoints.MapGet("/health", async (
@@ -43,6 +82,7 @@ internal static class TelemetryEndpoints
             return Results.Ok(new
             {
                 status = "ok",
+                version = HostVersion,
                 native = nativeStatus,
                 nativeScorerReady = nativeStatus == "ready",
                 phase = 4,
@@ -87,6 +127,7 @@ internal static class TelemetryEndpoints
                 return Results.Ok(new
                 {
                     generatedAtUtc = now,
+                    version = HostVersion,
                     phase = 4,
                     nativeStatus,
                     nativeScorerReady = nativeStatus == "ready",
@@ -143,6 +184,7 @@ internal static class TelemetryEndpoints
             return Results.Ok(new
             {
                 generatedAtUtc = now,
+                version = HostVersion,
                 phase = 4,
                 nativeStatus,
                 nativeScorerReady = nativeStatus == "ready",
