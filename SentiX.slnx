@@ -2,6 +2,7 @@
     <Folder Name="/src/">
         <Project Path="src/dotnet/SentiX.DecisionSwarm/SentiX.DecisionSwarm.csproj" />
         <Project Path="src/dotnet/SentiX.Domain/SentiX.Domain.csproj" />
+        <Project Path="src/dotnet/SentiX.Execution/SentiX.Execution.csproj" />
         <Project Path="src/dotnet/SentiX.Infrastructure/SentiX.Infrastructure.csproj" />
         <Project Path="src/dotnet/SentiX.NativeBridge/SentiX.NativeBridge.csproj" />
         <Project Path="src/dotnet/SentiX.Ingestion/SentiX.Ingestion.csproj" />
@@ -10,6 +11,7 @@
     </Folder>
     <Folder Name="/tests/">
         <Project Path="tests/SentiX.DecisionSwarm.Tests/SentiX.DecisionSwarm.Tests.csproj" />
+        <Project Path="tests/dotnet/SentiX.Execution.Tests/SentiX.Execution.Tests.csproj" />
         <Project Path="tests/SentiX.Integration.Tests/SentiX.Integration.Tests.csproj" />
         <Project Path="tests/SentiX.Risk.Tests/SentiX.Risk.Tests.csproj" />
     </Folder>
