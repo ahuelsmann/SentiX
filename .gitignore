@@ -445,6 +445,8 @@ coverage.cobertura.xml
 *.sock
 models/*.onnx
 
-# SentiX Web Frontend
+# SentiX Web Frontend & IDE Launch Profiles
 src/web/node_modules/
 src/web/dist/
+src/dotnet/SentiX.Host/wwwroot/
+**/Properties/launchSettings.json

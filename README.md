@@ -106,7 +106,7 @@ docker compose up -d --build
 
 ## Dashboard-Zugriff über SSH-Tunnel (http://localhost:18080/)
 
-`sentix-host` exponiert das Cockpit niemals öffentlich im Internet: Der Container bindet auf dem Linux-Server strikt an `127.0.0.1:8080`, und `UFW` blockiert jeden externen Zugriff auf Port `8080` (lediglich `22/tcp` für SSH mit Ed25519-Schlüssel ist geöffnet).
+`sentix-host` exponiert das Shadow Dashboard niemals öffentlich im Internet: Der Container bindet auf dem Linux-Server strikt an `127.0.0.1:8080`, und `UFW` blockiert jeden externen Zugriff auf Port `8080` (lediglich `22/tcp` für SSH mit Ed25519-Schlüssel ist geöffnet).
 
 1. **Lokale SSH-Konfiguration (`~/.ssh/config`):**
    ```sshconfig
@@ -133,6 +133,6 @@ docker compose up -d --build
 - **Phase 1 (Abgeschlossen):** Bootstrap, CI, PostgreSQL-Schema, C++ IPC-Daemon (HTML-Stripping + Mock-Scorer), Hard-Risk-Manager (100 % Coverage, Long-Only), NativeBridge & Alpaca News Collector.
 - **Phase 2 (Abgeschlossen):** Lokales ONNX-FinBERT (`INT8`), SEC-EDGAR- & X-Filtered-Stream-Adapter, Earnings-/Makro-Kalender-Sync (`scheduled_events`).
 - **Phase 3 (Abgeschlossen):** Decision-Swarm-Orchestrierung, Debatten-Persistenz & React-Dashboard im Shadow-Mode.
-- **Phase 4 (Aktuell — Paper Execution & Kill-Switch bereit; Shadow-Modus standardmäßig aktiv):** Alpaca Paper Execution (Bracket-Orders auf `paper-api.alpaca.markets`), persistenter PostgreSQL-Kill-Switch, Orders-Audit-Cockpit und 4–8 Wochen Live-Paper-Test gegen SPY.
+- **Phase 4 (Aktuell — Paper Execution & Kill-Switch bereit; Shadow-Modus standardmäßig aktiv):** Alpaca Paper Execution (Bracket-Orders auf `paper-api.alpaca.markets`), persistenter PostgreSQL-Kill-Switch, Shadow Dashboard (inkl. Orders-Audit & Versionsanzeige) und 4–8 Wochen Live-Paper-Test gegen SPY.
 
 **Git-Workflow:** Dieses Repository arbeitet strikt ohne GitHub Pull Requests (**No-PR-Policy**). Parallele Feature-Branches werden lokal geprüft, per `git merge --no-ff` in `main` integriert und direkt gepusht. Details siehe [`AGENTS.md`](./AGENTS.md).

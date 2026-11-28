@@ -88,7 +88,7 @@
 ### 3.4 Loopback HTTP Telemetry, Orders & Kill-Switch API (`TelemetryEndpoints`)
 - All endpoints emit `Cache-Control: no-store`.
 - `GET /health` & `GET /api/overview`:
-  - Report `phase = 4`, `tradingState` (`"ACTIVE"`, `"HALTED_MANUAL"`, `"HALTED_DAILY_LOSS"`, `"HALTED_SYSTEM_ERROR"`, or `"UNAVAILABLE"`), `paperSwitchArmed` (`AlpacaPaperOptions.TradingEnabled`), `paperExecutionConfigured` (`AlpacaPaperOptions.IsConfigured`), and effective `tradingEnabled` / `orderExecutionEnabled` (`paperSwitchArmed && tradingState == "ACTIVE"`).
+  - Report `version` (non-empty SemVer string resolved from `SentiX.Host` assembly metadata, e.g. `"0.4.0"`), `phase = 4`, `tradingState` (`"ACTIVE"`, `"HALTED_MANUAL"`, `"HALTED_DAILY_LOSS"`, `"HALTED_SYSTEM_ERROR"`, or `"UNAVAILABLE"`), `paperSwitchArmed` (`AlpacaPaperOptions.TradingEnabled`), `paperExecutionConfigured` (`AlpacaPaperOptions.IsConfigured`), and effective `tradingEnabled` / `orderExecutionEnabled` (`paperSwitchArmed && tradingState == "ACTIVE"`).
   - `/api/overview` additionally includes `counts.ordersTotal`, `counts.ordersSubmitted`, `counts.ordersPending` (`Status == "PENDING_SUBMIT"`), `counts.ordersRejected`, and `latestOrders` (newest 10 rows).
 - `GET /api/orders?limit=25`:
   - Returns `{ items, databaseConfigured }` ordered by `updated_at_utc DESC, submitted_at_utc DESC, client_order_id ASC` (`limit` clamped to `1..100`).
@@ -99,6 +99,6 @@
   - `/halt` transitions `ACTIVE` / `HALTED_MANUAL` to `HALTED_MANUAL` without downgrading `HALTED_DAILY_LOSS` or `HALTED_SYSTEM_ERROR`, returning the effective `tradingState` (`200 OK`).
   - `/resume` transitions `HALTED_MANUAL` (or `ACTIVE`) to `ACTIVE` (`200 OK`), or fails closed with `409 Conflict` (`{ error = "cannot_resume_state", code = "CannotResumeNonManualHalt", tradingState }`) on `HALTED_DAILY_LOSS` / `HALTED_SYSTEM_ERROR`.
 
-### 3.5 Phase 4 Cockpit UI (`src/web`)
-- Displays Phase 4 `Paper & shadow cockpit` status, distinguishing calm default Shadow Mode (`Disabled (Shadow Only)`) from armed paper mode (`Paper Armed (paper-api.alpaca.markets)`) and halted states (`Kill-Switch Engaged`).
+### 3.5 Phase 4 Shadow Dashboard UI (`src/web`)
+- Displays Phase 4 `Shadow Dashboard` (`<h1>Shadow Dashboard</h1>`, `<title>SentiX · Shadow Dashboard</title>`) together with a visible application version badge (`v0.4.0`, resolved from host telemetry `overview.version ?? health.version` with build-time `package.json` fallback), distinguishing calm default Shadow Mode (`Disabled (Shadow Only)`) from armed paper mode (`Paper Armed (paper-api.alpaca.markets)`) and halted states (`Kill-Switch Engaged`).
 - Provides one-click emergency `Engage Kill-Switch (HALT)` when `ACTIVE`, a two-step `Resume to Active` -> `Confirm Resume` / `Cancel` flow when `HALTED_MANUAL`, a circuit-breaker lock notice when `HALTED_DAILY_LOSS` / `HALTED_SYSTEM_ERROR`, and an accessible `#orders` audit table.
