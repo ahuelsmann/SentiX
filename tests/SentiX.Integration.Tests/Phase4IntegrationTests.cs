@@ -1060,6 +1060,87 @@ public sealed class Phase4IntegrationTests
         }
     }
 
+    [Fact]
+    public async Task ProcessAsync_PersistsRawMarketEventBeforeScoring_AndEmitsZeroOrdersWhenScoringIsCancelled()
+    {
+        using var cts = new CancellationTokenSource();
+        var sawRawEventBeforeScore = false;
+        var persistence = new InMemoryPipelinePersistence();
+        await using var cancellingNative = new MockUnixServer(async (stream, request, serverToken) =>
+        {
+            if (request.Type == IpcMessageType.HealthCheck)
+            {
+                await StubUnixNativeServer.WriteTestEnvelopeAsync(
+                    stream,
+                    request,
+                    IpcMessageType.HealthCheckAck,
+                    new NativeHealth(NativeStatus.Ready, "0.1.0", true, 10, 0),
+                    serverToken);
+                return;
+            }
+
+            if (request.Type == IpcMessageType.ScoreEvent)
+            {
+                sawRawEventBeforeScore = persistence.RecordedEventIds.Contains("evt_cancel_during_score");
+                await cts.CancelAsync();
+                await Task.Delay(TimeSpan.FromSeconds(5), serverToken);
+            }
+        });
+
+        var nativeClient = new NativeBridgeClient(cancellingNative.Path);
+        var auditStore = new InMemoryOrderAuditStore();
+        var brokerCalls = 0;
+        var engine = new StubPaperExecutionEngine(_ =>
+        {
+            Interlocked.Increment(ref brokerCalls);
+            throw new InvalidOperationException("Broker should not be invoked when scoring is cancelled.");
+        });
+        var paperOptions = new AlpacaPaperOptions
+        {
+            TradingEnabled = true,
+            PaperMode = true,
+            AllowShorting = false,
+            BaseUrl = "https://paper-api.alpaca.markets",
+            ApiKey = "PKTEST_KEY",
+            SecretKey = "SKTEST_SECRET"
+        };
+
+        using var pipeline = new MarketEventPipeline(
+            new ThrowingContextFactory(),
+            nativeClient,
+            NullLogger<MarketEventPipeline>.Instance,
+            isConfigured: true,
+            decisionSwarm: null,
+            quoteCache: null,
+            universe: null,
+            timeProvider: new FixedClock(FixedRegularMarketUtc),
+            paperExecution: engine,
+            paperOptions: paperOptions,
+            paperPortfolioProvider: null,
+            orderAuditStore: auditStore,
+            paperBrokerClient: null,
+            pipelinePersistence: persistence);
+
+        var marketEvent = new MarketEvent(
+            "evt_cancel_during_score",
+            EventSource.SecEdgar,
+            "SEC EDGAR",
+            FixedRegularMarketUtc,
+            "8-K Raw Audit Before Scoring",
+            "Summary",
+            "Body",
+            ["AAPL"]);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            pipeline.ProcessAsync(marketEvent, """{"raw":true}""", cts.Token));
+
+        Assert.True(sawRawEventBeforeScore);
+        Assert.Equal(["evt_cancel_during_score"], persistence.RecordedEventIds);
+        Assert.Empty(persistence.RecordedFastPathRows);
+        Assert.Equal(0, brokerCalls);
+        Assert.Empty(auditStore.Rows);
+    }
+
     private static WebApplicationFactory<Program> CreateHostFactory(
         Dictionary<string, string?> configOverrides,
         Action<IServiceCollection>? configureServices = null) =>
@@ -1390,10 +1471,23 @@ public sealed class Phase4IntegrationTests
     private sealed class InMemoryPipelinePersistence : IPipelinePersistence
     {
         private readonly HashSet<string> proposalIds = new(StringComparer.Ordinal);
+        public List<string> RecordedEventIds { get; } = [];
+        public List<FastPathResultRow> RecordedFastPathRows { get; } = [];
         public string TradingStateRaw { get; set; } = "ACTIVE";
 
-        public Task RecordMarketEventAndFastPathAsync(MarketEvent marketEvent, string source, string rawPayload, FastPathResultRow fastPathRow, CancellationToken token) =>
-            Task.CompletedTask;
+        public Task RecordMarketEventAsync(MarketEvent marketEvent, string source, string rawPayload, CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+            RecordedEventIds.Add(marketEvent.EventId);
+            return Task.CompletedTask;
+        }
+
+        public Task RecordFastPathResultAsync(FastPathResultRow fastPathRow, CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+            RecordedFastPathRows.Add(fastPathRow);
+            return Task.CompletedTask;
+        }
 
         public Task<string[]> GetUpcomingScheduleDescriptionsAsync(DateTimeOffset nowUtc, CancellationToken token) =>
             Task.FromResult(Array.Empty<string>());
@@ -1464,6 +1558,14 @@ public sealed class Phase4IntegrationTests
         }
 
         public static Task<StubUnixNativeServer> StartAsync() => Task.FromResult(new StubUnixNativeServer());
+
+        internal static Task WriteTestEnvelopeAsync<T>(
+            Stream stream,
+            IpcEnvelope<JsonElement> request,
+            IpcMessageType responseType,
+            T payload,
+            CancellationToken token) =>
+            WriteEnvelopeAsync(stream, request, responseType, payload, token);
 
         private static async Task WriteEnvelopeAsync<T>(
             Stream stream,

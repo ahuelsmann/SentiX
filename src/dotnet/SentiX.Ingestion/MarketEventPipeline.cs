@@ -27,7 +27,8 @@ public interface IMarketEventPipeline
 
 internal interface IPipelinePersistence
 {
-    Task RecordMarketEventAndFastPathAsync(MarketEvent marketEvent, string source, string rawPayload, FastPathResultRow fastPathRow, CancellationToken token);
+    Task RecordMarketEventAsync(MarketEvent marketEvent, string source, string rawPayload, CancellationToken token);
+    Task RecordFastPathResultAsync(FastPathResultRow fastPathRow, CancellationToken token);
     Task<string[]> GetUpcomingScheduleDescriptionsAsync(DateTimeOffset nowUtc, CancellationToken token);
     Task<bool> ProposalExistsAsync(string proposalId, CancellationToken token);
     Task<string?> ReadPersistedTradingStateAsync(CancellationToken token);
@@ -36,15 +37,15 @@ internal interface IPipelinePersistence
 
 internal sealed class EfCorePipelinePersistence(IDbContextFactory<SentiXDbContext> dbFactory) : IPipelinePersistence
 {
-    public async Task RecordMarketEventAndFastPathAsync(
+    public async Task RecordMarketEventAsync(
         MarketEvent marketEvent,
         string source,
         string rawPayload,
-        FastPathResultRow fastPathRow,
         CancellationToken token)
     {
         await using var db = await dbFactory.CreateDbContextAsync(token);
         var timestamp = marketEvent.PublishedAtUtc.ToUniversalTime();
+        // Persist the canonical raw event on receipt before native scoring/deduplication evaluates it.
         await db.Database.ExecuteSqlInterpolatedAsync($"""
             INSERT INTO market_events
                 (event_id, source, author, published_at_utc, headline, summary, body, source_tickers, raw_payload)
@@ -52,7 +53,13 @@ internal sealed class EfCorePipelinePersistence(IDbContextFactory<SentiXDbContex
                 {marketEvent.Summary}, {marketEvent.Body}, {marketEvent.SourceTickers}, CAST({rawPayload} AS jsonb))
             ON CONFLICT (event_id) DO NOTHING
             """, token);
+    }
 
+    public async Task RecordFastPathResultAsync(
+        FastPathResultRow fastPathRow,
+        CancellationToken token)
+    {
+        await using var db = await dbFactory.CreateDbContextAsync(token);
         db.FastPathResults.Add(fastPathRow);
         await db.SaveChangesAsync(token);
     }
@@ -224,6 +231,7 @@ public sealed class MarketEventPipeline : IMarketEventPipeline, IDisposable
     public async Task ProcessAsync(MarketEvent marketEvent, string rawPayload, CancellationToken token)
     {
         string source = JsonSerializer.SerializeToElement(marketEvent.Source, SentiXJson.Options).GetString()!;
+        await persistence.RecordMarketEventAsync(marketEvent, source, rawPayload, token);
 
         var attempt = await native.ScoreEventAsync(marketEvent, token);
         var score = attempt.Value;
@@ -247,7 +255,7 @@ public sealed class MarketEventPipeline : IMarketEventPipeline, IDisposable
             score?.Finbert.Neutral ?? 1, score?.Finbert.CompositeScore ?? 0, attempt.PassToDecisionSwarm,
             reason, score?.ProcessingTimeUs ?? 0, default);
 
-        await persistence.RecordMarketEventAndFastPathAsync(marketEvent, source, rawPayload, fastPathRow, token);
+        await persistence.RecordFastPathResultAsync(fastPathRow, token);
 
         if (attempt.PassToDecisionSwarm && score is not null && decisionSwarm is not null)
         {
