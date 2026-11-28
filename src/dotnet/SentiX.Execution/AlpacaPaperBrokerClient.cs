@@ -127,7 +127,7 @@ public sealed class AlpacaPaperBrokerClient : IAlpacaPaperBrokerClient
                     isRetryable: false);
             }
 
-            return MapResponse(response.StatusCode, bodyResult.Body!, order.ClientOrderId);
+            return MapResponse(response.StatusCode, bodyResult.Body!, order.ClientOrderId, order.Symbol.Trim());
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -175,7 +175,11 @@ public sealed class AlpacaPaperBrokerClient : IAlpacaPaperBrokerClient
         }
     }
 
-    private BrokerSubmissionResult MapResponse(HttpStatusCode statusCode, string body, string expectedClientOrderId)
+    private BrokerSubmissionResult MapResponse(
+        HttpStatusCode statusCode,
+        string body,
+        string expectedClientOrderId,
+        string expectedSymbol)
     {
         var code = (int)statusCode;
 
@@ -184,7 +188,7 @@ public sealed class AlpacaPaperBrokerClient : IAlpacaPaperBrokerClient
             _logger.LogInformation("Alpaca Paper reported HTTP 409 duplicate for {ClientOrderId}.", expectedClientOrderId);
             return Fail(
                 ExecutionRejectionCode.BrokerDuplicateOrder,
-                ExtractSafeErrorMessage(statusCode, body) ?? "HTTP 409 duplicate client_order_id.",
+                FormatSafeErrorReason(statusCode, "duplicate client_order_id", body),
                 statusCode,
                 isDuplicate: true,
                 isRetryable: false);
@@ -192,13 +196,12 @@ public sealed class AlpacaPaperBrokerClient : IAlpacaPaperBrokerClient
 
         if (statusCode == HttpStatusCode.UnprocessableEntity)
         {
-            var safeMessage = ExtractSafeErrorMessage(statusCode, body);
-            if (IsDuplicateClientOrderError(safeMessage ?? body))
+            if (IsDuplicateClientOrderBody(body))
             {
                 _logger.LogInformation("Alpaca Paper reported HTTP 422 duplicate client_order_id for {ClientOrderId}.", expectedClientOrderId);
                 return Fail(
                     ExecutionRejectionCode.BrokerDuplicateOrder,
-                    safeMessage ?? "HTTP 422 duplicate client_order_id.",
+                    FormatSafeErrorReason(statusCode, "duplicate client_order_id", body),
                     statusCode,
                     isDuplicate: true,
                     isRetryable: false);
@@ -207,7 +210,7 @@ public sealed class AlpacaPaperBrokerClient : IAlpacaPaperBrokerClient
             _logger.LogWarning("Alpaca Paper rejected order {ClientOrderId} with HTTP 422.", expectedClientOrderId);
             return Fail(
                 ExecutionRejectionCode.BrokerRejected,
-                safeMessage ?? "HTTP 422 order rejected by broker.",
+                FormatSafeErrorReason(statusCode, "order rejected by Alpaca Paper API", body),
                 statusCode,
                 isDuplicate: false,
                 isRetryable: false);
@@ -218,7 +221,7 @@ public sealed class AlpacaPaperBrokerClient : IAlpacaPaperBrokerClient
             _logger.LogWarning("Alpaca Paper rate limited order {ClientOrderId} (HTTP 429).", expectedClientOrderId);
             return Fail(
                 ExecutionRejectionCode.BrokerRateLimited,
-                "HTTP 429 rate limit exceeded on Alpaca Paper API.",
+                FormatSafeErrorReason(statusCode, "rate limit exceeded on Alpaca Paper API", body),
                 statusCode,
                 isDuplicate: false,
                 isRetryable: true);
@@ -229,7 +232,7 @@ public sealed class AlpacaPaperBrokerClient : IAlpacaPaperBrokerClient
             _logger.LogWarning("Alpaca Paper server error HTTP {StatusCode} for {ClientOrderId}.", code, expectedClientOrderId);
             return Fail(
                 ExecutionRejectionCode.BrokerServerError,
-                FormattableString.Invariant($"HTTP {code} server error from Alpaca Paper API."),
+                FormatSafeErrorReason(statusCode, "server error from Alpaca Paper API", body),
                 statusCode,
                 isDuplicate: false,
                 isRetryable: true);
@@ -237,20 +240,23 @@ public sealed class AlpacaPaperBrokerClient : IAlpacaPaperBrokerClient
 
         if (!IsSuccessStatusCode(code))
         {
-            var safeMessage = ExtractSafeErrorMessage(statusCode, body);
             _logger.LogWarning("Alpaca Paper rejected order {ClientOrderId} with HTTP {StatusCode}.", expectedClientOrderId, code);
             return Fail(
                 ExecutionRejectionCode.BrokerRejected,
-                safeMessage ?? FormattableString.Invariant($"HTTP {code} rejected by Alpaca Paper API."),
+                FormatSafeErrorReason(statusCode, "rejected by Alpaca Paper API", body),
                 statusCode,
                 isDuplicate: false,
                 isRetryable: false);
         }
 
-        return ParseSuccessReceipt(statusCode, body, expectedClientOrderId);
+        return ParseSuccessReceipt(statusCode, body, expectedClientOrderId, expectedSymbol);
     }
 
-    private BrokerSubmissionResult ParseSuccessReceipt(HttpStatusCode statusCode, string body, string expectedClientOrderId)
+    private BrokerSubmissionResult ParseSuccessReceipt(
+        HttpStatusCode statusCode,
+        string body,
+        string expectedClientOrderId,
+        string expectedSymbol)
     {
         if (string.IsNullOrWhiteSpace(body))
         {
@@ -294,6 +300,16 @@ public sealed class AlpacaPaperBrokerClient : IAlpacaPaperBrokerClient
                 return Fail(
                     ExecutionRejectionCode.MalformedBrokerResponse,
                     "Broker receipt client_order_id does not match submitted client_order_id.",
+                    statusCode,
+                    isDuplicate: false,
+                    isRetryable: false);
+            }
+
+            if (!string.Equals(symbol, expectedSymbol, StringComparison.OrdinalIgnoreCase))
+            {
+                return Fail(
+                    ExecutionRejectionCode.MalformedBrokerResponse,
+                    "Broker receipt symbol does not match submitted symbol.",
                     statusCode,
                     isDuplicate: false,
                     isRetryable: false);
@@ -476,23 +492,47 @@ public sealed class AlpacaPaperBrokerClient : IAlpacaPaperBrokerClient
 
     private static bool IsSuccessStatusCode(int statusCode) => statusCode is >= 200 and <= 299;
 
-    private static bool IsDuplicateClientOrderError(string text)
+    private static bool IsDuplicateClientOrderBody(string body)
     {
-        if (string.IsNullOrWhiteSpace(text))
+        if (string.IsNullOrWhiteSpace(body))
         {
             return false;
         }
 
-        var hasClientOrderRef = text.Contains("client_order_id", StringComparison.OrdinalIgnoreCase);
+        var textToInspect = body;
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.ValueKind == JsonValueKind.Object &&
+                doc.RootElement.TryGetProperty("message", out var msg) &&
+                msg.ValueKind == JsonValueKind.String)
+            {
+                textToInspect = msg.GetString() ?? body;
+            }
+        }
+        catch (JsonException)
+        {
+            // Non-JSON 422 body: inspect raw text only as a boolean predicate without surfacing it.
+        }
+
+        var hasClientOrderRef = textToInspect.Contains("client_order_id", StringComparison.OrdinalIgnoreCase);
         var hasDuplicateSignal =
-            text.Contains("unique", StringComparison.OrdinalIgnoreCase) ||
-            text.Contains("duplicate", StringComparison.OrdinalIgnoreCase) ||
-            text.Contains("already exists", StringComparison.OrdinalIgnoreCase);
+            textToInspect.Contains("unique", StringComparison.OrdinalIgnoreCase) ||
+            textToInspect.Contains("duplicate", StringComparison.OrdinalIgnoreCase) ||
+            textToInspect.Contains("already exists", StringComparison.OrdinalIgnoreCase);
 
         return hasClientOrderRef && hasDuplicateSignal;
     }
 
-    private static string? ExtractSafeErrorMessage(HttpStatusCode statusCode, string body)
+    private static string FormatSafeErrorReason(HttpStatusCode statusCode, string summary, string body)
+    {
+        var safeCode = TryExtractSafeErrorCode(body);
+        return safeCode is null
+            ? FormattableString.Invariant($"HTTP {(int)statusCode} {summary}.")
+            : FormattableString.Invariant($"HTTP {(int)statusCode} {summary} (alpaca_code={safeCode}).");
+    }
+
+    private static string? TryExtractSafeErrorCode(string body)
     {
         if (string.IsNullOrWhiteSpace(body))
         {
@@ -502,24 +542,52 @@ public sealed class AlpacaPaperBrokerClient : IAlpacaPaperBrokerClient
         try
         {
             using var doc = JsonDocument.Parse(body);
-            if (doc.RootElement.ValueKind == JsonValueKind.Object &&
-                doc.RootElement.TryGetProperty("message", out var msg) &&
-                msg.ValueKind == JsonValueKind.String)
+            if (doc.RootElement.ValueKind != JsonValueKind.Object ||
+                !doc.RootElement.TryGetProperty("code", out var element))
             {
-                var raw = msg.GetString();
-                if (!string.IsNullOrWhiteSpace(raw))
+                return null;
+            }
+
+            if (element.ValueKind == JsonValueKind.Number &&
+                element.TryGetInt64(out var numeric) &&
+                numeric >= 0)
+            {
+                return numeric.ToString(CultureInfo.InvariantCulture);
+            }
+
+            if (element.ValueKind == JsonValueKind.String)
+            {
+                var slug = element.GetString()?.Trim();
+                if (IsSafeErrorSlug(slug))
                 {
-                    var bounded = raw.Length > 240 ? raw[..240] : raw;
-                    return FormattableString.Invariant($"HTTP {(int)statusCode}: {bounded}");
+                    return slug;
                 }
             }
         }
         catch (JsonException)
         {
-            // Ignore malformed error JSON and fall back to status-only message.
+            // Never surface arbitrary or malformed broker error payloads.
         }
 
         return null;
+    }
+
+    private static bool IsSafeErrorSlug(string? slug)
+    {
+        if (string.IsNullOrEmpty(slug) || slug.Length > 32)
+        {
+            return false;
+        }
+
+        foreach (var ch in slug)
+        {
+            if (!(char.IsAsciiLetterOrDigit(ch) || ch is '_' or '-'))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static bool TryReadRequiredString(JsonElement root, string property, out string value)

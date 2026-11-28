@@ -134,9 +134,10 @@ public sealed class AlpacaPaperBrokerClientTests
         ExecutionRejectionCode expectedCode,
         bool expectedRetryable)
     {
+        const string rawBodyMarker = "RAW_BROKER_SECRET_ECHO_MARKER";
         var handler = new StubHttpMessageHandler(_ => StubHttpMessageHandler.Json(
             status,
-            $$$"""{"message":"rejected {{{ExecutionTestFixtures.TestSecretKey}}}"}"""));
+            $$$"""{"message":"{{{rawBodyMarker}}} {{{ExecutionTestFixtures.TestSecretKey}}}"}"""));
         var client = new AlpacaPaperBrokerClient(new HttpClient(handler), ExecutionTestFixtures.ReadyPaperOptions());
 
         var result = await client.SubmitOrderAsync(SampleBracketOrder(), CancellationToken.None);
@@ -146,6 +147,38 @@ public sealed class AlpacaPaperBrokerClientTests
         Assert.Equal(expectedRetryable, result.IsRetryable);
         Assert.Equal(expectedCode, result.FailureCode);
         Assert.Equal(status, result.StatusCode);
+        Assert.NotNull(result.FailureReason);
+        Assert.DoesNotContain(ExecutionTestFixtures.TestSecretKey, result.FailureReason, StringComparison.Ordinal);
+        Assert.DoesNotContain(ExecutionTestFixtures.TestApiKey, result.FailureReason, StringComparison.Ordinal);
+        Assert.DoesNotContain(rawBodyMarker, result.FailureReason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task HttpErrors_NeverSurfaceRawBodyOrEchoedSecrets_AndAllowOnlySafeErrorCodes()
+    {
+        const string sensitiveMarker = "ECHOED_AUTH_HEADER_SENSITIVE_MARKER_9911";
+
+        var withNumericCodeHandler = new StubHttpMessageHandler(_ => StubHttpMessageHandler.Json(
+            HttpStatusCode.UnprocessableEntity,
+            $$$"""{"code":40310000,"message":"echo {{{sensitiveMarker}}} {{{ExecutionTestFixtures.TestSecretKey}}}"}"""));
+        var withUnsafeSlugHandler = new StubHttpMessageHandler(_ => StubHttpMessageHandler.Json(
+            HttpStatusCode.BadRequest,
+            $$$"""{"code":"invalid {{{sensitiveMarker}}}","message":"raw {{{sensitiveMarker}}}"}"""));
+
+        var numericClient = new AlpacaPaperBrokerClient(new HttpClient(withNumericCodeHandler), ExecutionTestFixtures.ReadyPaperOptions());
+        var unsafeClient = new AlpacaPaperBrokerClient(new HttpClient(withUnsafeSlugHandler), ExecutionTestFixtures.ReadyPaperOptions());
+
+        var numericResult = await numericClient.SubmitOrderAsync(SampleBracketOrder(), CancellationToken.None);
+        var unsafeResult = await unsafeClient.SubmitOrderAsync(SampleBracketOrder(), CancellationToken.None);
+
+        Assert.False(numericResult.IsSuccess);
+        Assert.Equal("HTTP 422 order rejected by Alpaca Paper API (alpaca_code=40310000).", numericResult.FailureReason);
+        Assert.DoesNotContain(sensitiveMarker, numericResult.FailureReason, StringComparison.Ordinal);
+        Assert.DoesNotContain(ExecutionTestFixtures.TestSecretKey, numericResult.FailureReason, StringComparison.Ordinal);
+
+        Assert.False(unsafeResult.IsSuccess);
+        Assert.Equal("HTTP 400 rejected by Alpaca Paper API.", unsafeResult.FailureReason);
+        Assert.DoesNotContain(sensitiveMarker, unsafeResult.FailureReason, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -189,6 +222,8 @@ public sealed class AlpacaPaperBrokerClientTests
     [InlineData("""{"id":"ord_1","symbol":"AAPL","status":"accepted"}""")]
     [InlineData("""{"id":"","client_order_id":"SX-20261127-AAPL-BUY-01234567","symbol":"AAPL","status":"accepted"}""")]
     [InlineData("""{"id":"ord_1","client_order_id":"SX-DIFFERENT","symbol":"AAPL","status":"accepted"}""")]
+    [InlineData("""{"id":"ord_1","client_order_id":"SX-20261127-AAPL-BUY-01234567","symbol":"","status":"accepted"}""")]
+    [InlineData("""{"id":"ord_1","client_order_id":"SX-20261127-AAPL-BUY-01234567","symbol":"MSFT","status":"accepted"}""")]
     public async Task MalformedNullOrMismatchedBrokerJson_FailsClosed(string responseBody)
     {
         var handler = new StubHttpMessageHandler(_ => StubHttpMessageHandler.Json(HttpStatusCode.OK, responseBody));
@@ -200,6 +235,21 @@ public sealed class AlpacaPaperBrokerClientTests
         Assert.False(result.IsRetryable);
         Assert.Equal(ExecutionRejectionCode.MalformedBrokerResponse, result.FailureCode);
         Assert.Null(result.Receipt);
+    }
+
+    [Fact]
+    public async Task ReceiptSymbol_MatchesCaseInsensitively_AndNormalizesToUpper()
+    {
+        const string clientOrderId = "SX-20261127-AAPL-BUY-01234567";
+        var handler = new StubHttpMessageHandler(_ =>
+            StubHttpMessageHandler.Json(HttpStatusCode.OK, ExecutionTestFixtures.AcceptedOrderJson(clientOrderId, symbol: "aapl")));
+        var client = new AlpacaPaperBrokerClient(new HttpClient(handler), ExecutionTestFixtures.ReadyPaperOptions());
+
+        var result = await client.SubmitOrderAsync(SampleBracketOrder(clientOrderId), CancellationToken.None);
+
+        Assert.True(result.IsSuccess);
+        Assert.NotNull(result.Receipt);
+        Assert.Equal("AAPL", result.Receipt.Symbol);
     }
 
     [Fact]

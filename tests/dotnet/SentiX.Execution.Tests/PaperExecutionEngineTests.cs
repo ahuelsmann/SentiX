@@ -261,6 +261,37 @@ public sealed class PaperExecutionEngineTests
         Assert.Equal(sentIds[0], sentIds[1]);
     }
 
+    [Theory]
+    [InlineData("SX-20261126-AAPL-BUY-00000000")]
+    [InlineData("SX-20261127-MSFT-BUY-00000000")]
+    [InlineData("SX-20261127-AAPL-SELL-00000000")]
+    [InlineData("SX-20261127-AAPL-BUY-deadbeef")]
+    [InlineData("arbitrary-noncanonical-id")]
+    public async Task MismatchedOrStaleRiskDecisionClientOrderId_IsRejectedWithoutBrokerCall(string suppliedClientOrderId)
+    {
+        var handler = new StubHttpMessageHandler(_ => throw new InvalidOperationException("Broker should not be called."));
+        var engine = CreateEngine(ExecutionTestFixtures.ReadyPaperOptions(), new StaticTradingStateProvider(TradingState.Active), handler);
+
+        var proposal = ExecutionTestFixtures.BuyProposal(ticker: "AAPL");
+        var decision = new RiskDecision(
+            Approved: true,
+            EffectiveTradingState: TradingState.Active,
+            Violations: [],
+            CalculatedQuantity: 10,
+            ClampedStopLossPct: 0.03m,
+            ClampedTakeProfitPct: 0.06m,
+            ClientOrderId: suppliedClientOrderId);
+
+        var request = PaperOrderExecutionRequest.FromRiskDecision(proposal, decision, 150.00m);
+        var result = await engine.ExecuteAsync(request, CancellationToken.None);
+
+        Assert.False(result.Executed);
+        Assert.Equal(ExecutionOutcomeStatus.RejectedPreFlight, result.Status);
+        Assert.Equal(ExecutionRejectionCode.InvalidClientOrderId, result.RejectionCode);
+        Assert.Null(result.ClientOrderId);
+        Assert.Equal(0, handler.CallCount);
+    }
+
     [Fact]
     public async Task HardRiskToPaperExecution_EndToEndHappyPath_SubmitsValidPaperBracketOrder()
     {

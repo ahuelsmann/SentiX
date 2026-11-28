@@ -237,40 +237,49 @@ public sealed class PaperExecutionEngine : IPaperExecutionEngine
             }
         }
 
-        // 7. Deterministic client_order_id resolution / validation.
-        string clientOrderId;
+        // 7. Deterministic client_order_id canonical derivation & verification.
+        string canonicalClientOrderId;
+        try
+        {
+            canonicalClientOrderId = ClientOrderIdGenerator.Create(
+                proposal.EventId ?? string.Empty,
+                proposal.ProposalId ?? string.Empty,
+                ticker,
+                proposal.Action,
+                evaluatedAtUtc);
+        }
+        catch (Exception ex) when (ex is ArgumentException or ArgumentOutOfRangeException)
+        {
+            return RejectPreFlight(
+                ExecutionRejectionCode.InvalidClientOrderId,
+                $"Failed to generate canonical deterministic client_order_id: {ex.Message}",
+                evaluatedAtUtc,
+                persistedState.State);
+        }
+
+        if (!IsValidClientOrderId(canonicalClientOrderId))
+        {
+            return RejectPreFlight(
+                ExecutionRejectionCode.InvalidClientOrderId,
+                $"Generated canonical client_order_id '{canonicalClientOrderId}' is invalid.",
+                evaluatedAtUtc,
+                persistedState.State);
+        }
+
         if (!string.IsNullOrWhiteSpace(risk.ClientOrderId))
         {
-            clientOrderId = risk.ClientOrderId.Trim();
-            if (!IsValidClientOrderId(clientOrderId))
+            var suppliedId = risk.ClientOrderId.Trim();
+            if (!string.Equals(suppliedId, canonicalClientOrderId, StringComparison.Ordinal))
             {
                 return RejectPreFlight(
                     ExecutionRejectionCode.InvalidClientOrderId,
-                    $"ClientOrderId '{clientOrderId}' is invalid or exceeds {ClientOrderIdGenerator.MaxLength} characters.",
+                    "Supplied RiskDecision.ClientOrderId does not match canonical deterministic client_order_id for this proposal and trading date.",
                     evaluatedAtUtc,
                     persistedState.State);
             }
         }
-        else
-        {
-            try
-            {
-                clientOrderId = ClientOrderIdGenerator.Create(
-                    proposal.EventId ?? string.Empty,
-                    proposal.ProposalId ?? string.Empty,
-                    ticker,
-                    proposal.Action,
-                    evaluatedAtUtc);
-            }
-            catch (Exception ex) when (ex is ArgumentException or ArgumentOutOfRangeException)
-            {
-                return RejectPreFlight(
-                    ExecutionRejectionCode.InvalidClientOrderId,
-                    $"Failed to generate deterministic client_order_id: {ex.Message}",
-                    evaluatedAtUtc,
-                    persistedState.State);
-            }
-        }
+
+        var clientOrderId = canonicalClientOrderId;
 
         // 8. Dispatch to strict paper broker client.
         var wireOrder = new AlpacaBracketOrderRequest(
