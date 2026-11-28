@@ -239,8 +239,8 @@ public sealed class PaperExecutionEngineTests
 
         var engine = CreateEngine(ExecutionTestFixtures.ReadyPaperOptions(), new StaticTradingStateProvider(TradingState.Active), handler);
         var proposal = ExecutionTestFixtures.BuyProposal();
-        var decisionWithoutId = ExecutionTestFixtures.ApprovedDecision(proposal, includeClientOrderId: false);
-        var request = PaperOrderExecutionRequest.FromRiskDecision(proposal, decisionWithoutId, 150.00m);
+        var approvedDecision = ExecutionTestFixtures.ApprovedDecision(proposal, includeClientOrderId: true);
+        var request = PaperOrderExecutionRequest.FromRiskDecision(proposal, approvedDecision, 150.00m);
 
         var first = await engine.ExecuteAsync(request, CancellationToken.None);
         var second = await engine.ExecuteAsync(request, CancellationToken.None);
@@ -262,12 +262,15 @@ public sealed class PaperExecutionEngineTests
     }
 
     [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
     [InlineData("SX-20261126-AAPL-BUY-00000000")]
     [InlineData("SX-20261127-MSFT-BUY-00000000")]
     [InlineData("SX-20261127-AAPL-SELL-00000000")]
     [InlineData("SX-20261127-AAPL-BUY-deadbeef")]
     [InlineData("arbitrary-noncanonical-id")]
-    public async Task MismatchedOrStaleRiskDecisionClientOrderId_IsRejectedWithoutBrokerCall(string suppliedClientOrderId)
+    public async Task NullBlankMismatchedOrStaleRiskDecisionClientOrderId_IsRejectedWithoutBrokerCall(string? suppliedClientOrderId)
     {
         var handler = new StubHttpMessageHandler(_ => throw new InvalidOperationException("Broker should not be called."));
         var engine = CreateEngine(ExecutionTestFixtures.ReadyPaperOptions(), new StaticTradingStateProvider(TradingState.Active), handler);

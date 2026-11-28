@@ -154,31 +154,42 @@ public sealed class AlpacaPaperBrokerClientTests
     }
 
     [Fact]
-    public async Task HttpErrors_NeverSurfaceRawBodyOrEchoedSecrets_AndAllowOnlySafeErrorCodes()
+    public async Task HttpErrors_NeverSurfaceRawBodyOrEchoedSecrets_AndAllowOnlyKnownNumericCodes()
     {
         const string sensitiveMarker = "ECHOED_AUTH_HEADER_SENSITIVE_MARKER_9911";
+        const string syntheticSlugSecret = "secret_slug_token_1234";
 
-        var withNumericCodeHandler = new StubHttpMessageHandler(_ => StubHttpMessageHandler.Json(
+        var withKnownNumericCodeHandler = new StubHttpMessageHandler(_ => StubHttpMessageHandler.Json(
             HttpStatusCode.UnprocessableEntity,
             $$$"""{"code":40310000,"message":"echo {{{sensitiveMarker}}} {{{ExecutionTestFixtures.TestSecretKey}}}"}"""));
-        var withUnsafeSlugHandler = new StubHttpMessageHandler(_ => StubHttpMessageHandler.Json(
+        var withSlugSecretHandler = new StubHttpMessageHandler(_ => StubHttpMessageHandler.Json(
             HttpStatusCode.BadRequest,
-            $$$"""{"code":"invalid {{{sensitiveMarker}}}","message":"raw {{{sensitiveMarker}}}"}"""));
+            $$$"""{"code":"{{{syntheticSlugSecret}}}","message":"raw {{{sensitiveMarker}}}"}"""));
+        var withUnknownNumericCodeHandler = new StubHttpMessageHandler(_ => StubHttpMessageHandler.Json(
+            HttpStatusCode.BadRequest,
+            """{"code":999999999999,"message":"unrecognized code"}"""));
 
-        var numericClient = new AlpacaPaperBrokerClient(new HttpClient(withNumericCodeHandler), ExecutionTestFixtures.ReadyPaperOptions());
-        var unsafeClient = new AlpacaPaperBrokerClient(new HttpClient(withUnsafeSlugHandler), ExecutionTestFixtures.ReadyPaperOptions());
+        var numericClient = new AlpacaPaperBrokerClient(new HttpClient(withKnownNumericCodeHandler), ExecutionTestFixtures.ReadyPaperOptions());
+        var slugClient = new AlpacaPaperBrokerClient(new HttpClient(withSlugSecretHandler), ExecutionTestFixtures.ReadyPaperOptions());
+        var unknownNumericClient = new AlpacaPaperBrokerClient(new HttpClient(withUnknownNumericCodeHandler), ExecutionTestFixtures.ReadyPaperOptions());
 
         var numericResult = await numericClient.SubmitOrderAsync(SampleBracketOrder(), CancellationToken.None);
-        var unsafeResult = await unsafeClient.SubmitOrderAsync(SampleBracketOrder(), CancellationToken.None);
+        var slugResult = await slugClient.SubmitOrderAsync(SampleBracketOrder(), CancellationToken.None);
+        var unknownNumericResult = await unknownNumericClient.SubmitOrderAsync(SampleBracketOrder(), CancellationToken.None);
 
         Assert.False(numericResult.IsSuccess);
         Assert.Equal("HTTP 422 order rejected by Alpaca Paper API (alpaca_code=40310000).", numericResult.FailureReason);
         Assert.DoesNotContain(sensitiveMarker, numericResult.FailureReason, StringComparison.Ordinal);
         Assert.DoesNotContain(ExecutionTestFixtures.TestSecretKey, numericResult.FailureReason, StringComparison.Ordinal);
 
-        Assert.False(unsafeResult.IsSuccess);
-        Assert.Equal("HTTP 400 rejected by Alpaca Paper API.", unsafeResult.FailureReason);
-        Assert.DoesNotContain(sensitiveMarker, unsafeResult.FailureReason, StringComparison.Ordinal);
+        Assert.False(slugResult.IsSuccess);
+        Assert.Equal("HTTP 400 rejected by Alpaca Paper API.", slugResult.FailureReason);
+        Assert.DoesNotContain(syntheticSlugSecret, slugResult.FailureReason, StringComparison.Ordinal);
+        Assert.DoesNotContain(sensitiveMarker, slugResult.FailureReason, StringComparison.Ordinal);
+
+        Assert.False(unknownNumericResult.IsSuccess);
+        Assert.Equal("HTTP 400 rejected by Alpaca Paper API.", unknownNumericResult.FailureReason);
+        Assert.DoesNotContain("999999999999", unknownNumericResult.FailureReason, StringComparison.Ordinal);
     }
 
     [Fact]

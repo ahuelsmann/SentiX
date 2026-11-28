@@ -266,17 +266,23 @@ public sealed class PaperExecutionEngine : IPaperExecutionEngine
                 persistedState.State);
         }
 
-        if (!string.IsNullOrWhiteSpace(risk.ClientOrderId))
+        if (string.IsNullOrWhiteSpace(risk.ClientOrderId))
         {
-            var suppliedId = risk.ClientOrderId.Trim();
-            if (!string.Equals(suppliedId, canonicalClientOrderId, StringComparison.Ordinal))
-            {
-                return RejectPreFlight(
-                    ExecutionRejectionCode.InvalidClientOrderId,
-                    "Supplied RiskDecision.ClientOrderId does not match canonical deterministic client_order_id for this proposal and trading date.",
-                    evaluatedAtUtc,
-                    persistedState.State);
-            }
+            return RejectPreFlight(
+                ExecutionRejectionCode.InvalidClientOrderId,
+                "Approved RiskDecision must provide a non-empty canonical ClientOrderId.",
+                evaluatedAtUtc,
+                persistedState.State);
+        }
+
+        var suppliedId = risk.ClientOrderId.Trim();
+        if (!string.Equals(suppliedId, canonicalClientOrderId, StringComparison.Ordinal))
+        {
+            return RejectPreFlight(
+                ExecutionRejectionCode.InvalidClientOrderId,
+                "Supplied RiskDecision.ClientOrderId does not match canonical deterministic client_order_id for this proposal and trading date.",
+                evaluatedAtUtc,
+                persistedState.State);
         }
 
         var clientOrderId = canonicalClientOrderId;

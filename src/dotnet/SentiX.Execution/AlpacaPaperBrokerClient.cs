@@ -543,26 +543,24 @@ public sealed class AlpacaPaperBrokerClient : IAlpacaPaperBrokerClient
         {
             using var doc = JsonDocument.Parse(body);
             if (doc.RootElement.ValueKind != JsonValueKind.Object ||
-                !doc.RootElement.TryGetProperty("code", out var element))
+                !doc.RootElement.TryGetProperty("code", out var element) ||
+                element.ValueKind != JsonValueKind.Number ||
+                !element.TryGetInt64(out var numeric))
             {
                 return null;
             }
 
-            if (element.ValueKind == JsonValueKind.Number &&
-                element.TryGetInt64(out var numeric) &&
-                numeric >= 0)
+            return numeric switch
             {
-                return numeric.ToString(CultureInfo.InvariantCulture);
-            }
-
-            if (element.ValueKind == JsonValueKind.String)
-            {
-                var slug = element.GetString()?.Trim();
-                if (IsSafeErrorSlug(slug))
-                {
-                    return slug;
-                }
-            }
+                40010001 => "40010001",
+                40310000 => "40310000",
+                40410000 => "40410000",
+                40910000 => "40910000",
+                42210000 => "42210000",
+                42910000 => "42910000",
+                50010000 => "50010000",
+                _ => null
+            };
         }
         catch (JsonException)
         {
@@ -570,24 +568,6 @@ public sealed class AlpacaPaperBrokerClient : IAlpacaPaperBrokerClient
         }
 
         return null;
-    }
-
-    private static bool IsSafeErrorSlug(string? slug)
-    {
-        if (string.IsNullOrEmpty(slug) || slug.Length > 32)
-        {
-            return false;
-        }
-
-        foreach (var ch in slug)
-        {
-            if (!(char.IsAsciiLetterOrDigit(ch) || ch is '_' or '-'))
-            {
-                return false;
-            }
-        }
-
-        return true;
     }
 
     private static bool TryReadRequiredString(JsonElement root, string property, out string value)

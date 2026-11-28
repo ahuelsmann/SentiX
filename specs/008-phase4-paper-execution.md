@@ -29,12 +29,12 @@
 6. **Deterministic Idempotency (`client_order_id`):**
    - Every order uses the Spec 004 deterministic `client_order_id`:
      `SX-{etDate:yyyyMMdd}-{UPPER_TICKER}-{BUY|SELL}-{sha256LowerHex8}` (`<= 48` chars, generated via `SentiX.Risk.ClientOrderIdGenerator`).
-   - `PaperExecutionEngine` always recomputes the canonical `client_order_id` from `(Proposal.EventId, Proposal.ProposalId, Ticker, Action, EvaluatedAtUtc)`. If `RiskDecision.ClientOrderId` is present and contradicts the canonical ID for that proposal and ET trading date, execution MUST fail closed (`InvalidClientOrderId`) with zero broker calls.
+   - `PaperExecutionEngine` always recomputes the canonical `client_order_id` from `(Proposal.EventId, Proposal.ProposalId, Ticker, Action, EvaluatedAtUtc)` and requires `RiskDecision.ClientOrderId` to be non-empty and match the canonical ID (`StringComparison.Ordinal`). If `RiskDecision.ClientOrderId` is null, blank, or contradicts the canonical ID for that proposal and ET trading date, execution MUST fail closed (`InvalidClientOrderId`) with zero broker calls.
    - Re-submitting the same `(EventId, ProposalId, Ticker, Action)` on the same `America/New_York` trading date produces the identical `client_order_id`.
 7. **Broker Failure & Duplicate Handling (Non-Throwing):**
    - HTTP `409 Conflict` and `422 Unprocessable Entity` duplicate `client_order_id` responses map cleanly to `ExecutionOutcomeStatus.DuplicateOrder` (`IsDuplicate = true`, `IsRetryable = false`).
    - HTTP `429 Too Many Requests`, `5xx`, timeouts, network/stream errors, oversized bodies (`> 256 KiB`), empty/null JSON, malformed JSON, or missing/mismatched receipt fields (`id`, `client_order_id`, `symbol`, `status`) fail closed cleanly into structured `PaperExecutionResult` / `BrokerSubmissionResult` outcomes without throwing unhandled exceptions.
-   - `FailureReason` MUST contain only structured HTTP status codes and bounded allowlisted numeric/slug error codes — never raw broker response body text or free-form broker `message` strings.
+   - `FailureReason` MUST contain only structured HTTP status codes and static allowlisted Alpaca numeric error codes — never arbitrary strings, slugs, or free-form text from broker JSON.
 8. **No `alpaca` CLI in Hot-Path:**
    - All order submissions use `HttpClient` against Alpaca Paper REST API v2; invoking the `alpaca` CLI in runtime code is forbidden.
 
